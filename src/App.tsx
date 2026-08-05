@@ -678,6 +678,46 @@ interface CustomAgentDef {
   createdAt: string
 }
 
+const API = "https://geuxedpujvockbvdrhoq.supabase.co/functions/v1/make-server-637cd706"
+const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdldXhlZHB1anZvY2tidmRyaG9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MTMyOTUsImV4cCI6MjEwMTQ4OTI5NX0.gq5GPxUVy8SGjiW4ZzwwlMTLlMex31eLph95v7N8tDo"
+const API_HEADERS = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ANON_KEY}` }
+
+const LS_KEY = 'logsense-custom-agents'
+
+function lsLoad(): CustomAgentDef[] {
+  try { return JSON.parse(localStorage.getItem(LS_KEY) ?? '[]') } catch { return [] }
+}
+function lsSave(agents: CustomAgentDef[]) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(agents)) } catch { /* quota */ }
+}
+
+async function fetchAgents(): Promise<CustomAgentDef[]> {
+  // Always return localStorage immediately; try to hydrate from DB in background
+  const local = lsLoad()
+  try {
+    const r = await fetch(`${API}/agents`, { headers: API_HEADERS })
+    if (r.ok) {
+      const remote: CustomAgentDef[] = await r.json()
+      if (Array.isArray(remote) && remote.length >= local.length) {
+        lsSave(remote)
+        return remote
+      }
+    }
+  } catch { /* use local */ }
+  return local
+}
+
+async function saveAgents(agents: CustomAgentDef[]): Promise<void> {
+  lsSave(agents)
+  try {
+    await fetch(`${API}/agents`, {
+      method: 'POST',
+      headers: API_HEADERS,
+      body: JSON.stringify(agents),
+    })
+  } catch { /* localStorage already saved */ }
+}
+
 const AGENT_CAPABILITIES = [
   'Log search', 'Anomaly detection', 'RCA reasoning', 'Alert routing',
   'Cross-LoB correlation', 'SLA monitoring', 'Trend analysis', 'Incident summarisation',
@@ -3633,6 +3673,15 @@ function CustomAgentSection({ domain, onAgentCreated }: {
   const [created, setCreated] = useState<CustomAgentDef[]>([])
   const [showForm, setShowForm] = useState(false)
   const [runningId, setRunningId] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    fetchAgents().then(agents => {
+      setCreated(agents)
+      agents.forEach(ag => onAgentCreated(ag))
+      setLoading(false)
+    })
+  }, [])
 
   function toggleCap(cap: string) {
     setCaps(prev => prev.includes(cap) ? prev.filter(c => c !== cap) : [...prev, cap])
@@ -3648,9 +3697,17 @@ function CustomAgentSection({ domain, onAgentCreated }: {
       model: agentModel,
       createdAt: new Date().toISOString(),
     }
-    setCreated(prev => [ag, ...prev])
+    const next = [ag, ...created]
+    setCreated(next)
+    saveAgents(next)
     onAgentCreated(ag)
     setName(''); setDesc(''); setCaps([]); setShowForm(false)
+  }
+
+  function handleDelete(id: string) {
+    const next = created.filter(a => a.id !== id)
+    setCreated(next)
+    saveAgents(next)
   }
 
   return (
@@ -3742,7 +3799,11 @@ function CustomAgentSection({ domain, onAgentCreated }: {
       )}
 
       {/* Existing agents */}
-      {created.length === 0 && !showForm ? (
+      {loading ? (
+        <div className="card p-8 flex flex-col items-center gap-3 text-center">
+          <div className="mono text-[12px] text-[var(--c-faint)]">⠸ Loading agents…</div>
+        </div>
+      ) : created.length === 0 && !showForm ? (
         <div className="card p-8 flex flex-col items-center gap-3 text-center">
           <span className="text-2xl" style={{ color: C.purple }}>◈</span>
           <div className="mono text-[12px] text-[var(--c-dim)]">No custom agents yet</div>
@@ -3763,17 +3824,27 @@ function CustomAgentSection({ domain, onAgentCreated }: {
                     <span className="mono text-[9px] px-1 rounded" style={{ background: a(C.purple, 0.08), color: C.purple }}>
                       {LLM_MODELS.find(m => m.id === ag.model)?.name ?? ag.model}
                     </span>
-                    <button
-                      onClick={() => setRunningId(runningId === ag.id ? null : ag.id)}
-                      className="mono text-[10px] px-2.5 py-1 rounded ml-auto transition-colors"
-                      style={{
-                        background: runningId === ag.id ? a(C.purple, 0.18) : a(C.purple, 0.1),
-                        border: `1px solid ${a(C.purple, 0.35)}`,
-                        color: C.purple,
-                      }}
-                    >
-                      {runningId === ag.id ? '▼ Running' : '▶ Run'}
-                    </button>
+                    <div className="flex items-center gap-2 ml-auto">
+                      <button
+                        onClick={() => setRunningId(runningId === ag.id ? null : ag.id)}
+                        className="mono text-[10px] px-2.5 py-1 rounded transition-colors"
+                        style={{
+                          background: runningId === ag.id ? a(C.purple, 0.18) : a(C.purple, 0.1),
+                          border: `1px solid ${a(C.purple, 0.35)}`,
+                          color: C.purple,
+                        }}
+                      >
+                        {runningId === ag.id ? '▼ Running' : '▶ Run'}
+                      </button>
+                      <button
+                        onClick={() => handleDelete(ag.id)}
+                        className="mono text-[10px] px-2 py-1 rounded transition-colors"
+                        style={{ border: `1px solid ${C.border}`, color: C.faint }}
+                        title="Delete agent"
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
                   {ag.description && <div className="mono text-[11px] text-[var(--c-dim)] mt-0.5">{ag.description}</div>}
                   <div className="flex flex-wrap gap-1.5 mt-2">
