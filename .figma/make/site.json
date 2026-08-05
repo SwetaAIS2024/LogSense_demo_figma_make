@@ -1,0 +1,11 @@
+{
+  "title": "Smart_Log_Analytics_tool_SmartSense",
+  "description": "Analyze logs with dynamic dashboards, error insights, anomaly detection, and AI-driven root cause analysis to optimize system performance and reliability.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
