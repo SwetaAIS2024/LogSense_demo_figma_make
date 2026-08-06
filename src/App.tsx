@@ -80,6 +80,7 @@ function usePrefersDark() {
 type DataSource = 'demo' | 'elastic'
 type NavSection = 'lob' | 'logs' | 'errors' | 'anomalies' | 'sla' | 'rca' | 'agent' | 'pipeline'
 type TimeWindow = '1m' | '5m' | '15m' | '1h' | '6h' | '24h' | '7d'
+type DateRange = { from: Date; to: Date; label: string }
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -734,6 +735,161 @@ const TIME_WINDOWS: { id: TimeWindow; label: string }[] = [
   { id: '7d', label: '7d' },
 ]
 
+const TIME_WINDOW_MS: Record<TimeWindow, number> = {
+  '1m': 60_000, '5m': 5 * 60_000, '15m': 15 * 60_000,
+  '1h': 3_600_000, '6h': 6 * 3_600_000, '24h': 86_400_000, '7d': 7 * 86_400_000,
+}
+
+function dateRangeToTimeWindow(r: DateRange): TimeWindow {
+  const ms = r.to.getTime() - r.from.getTime()
+  if (ms <= 2 * 60_000) return '1m'
+  if (ms <= 10 * 60_000) return '5m'
+  if (ms <= 30 * 60_000) return '15m'
+  if (ms <= 2 * 3_600_000) return '1h'
+  if (ms <= 12 * 3_600_000) return '6h'
+  if (ms <= 2 * 86_400_000) return '24h'
+  return '7d'
+}
+
+const RANGE_PRESETS: { label: string; ms: number }[] = [
+  { label: 'Last 5 min',   ms: 5 * 60_000 },
+  { label: 'Last 15 min',  ms: 15 * 60_000 },
+  { label: 'Last 1 hour',  ms: 3_600_000 },
+  { label: 'Last 6 hours', ms: 6 * 3_600_000 },
+  { label: 'Last 24 hours',ms: 86_400_000 },
+  { label: 'Last 7 days',  ms: 7 * 86_400_000 },
+  { label: 'Last 30 days', ms: 30 * 86_400_000 },
+  { label: 'Last 90 days', ms: 90 * 86_400_000 },
+  { label: 'Last 6 months',ms: 182 * 86_400_000 },
+  { label: 'Last 1 year',  ms: 365 * 86_400_000 },
+  { label: 'Last 2 years', ms: 2 * 365 * 86_400_000 },
+  { label: 'Last 3 years', ms: 3 * 365 * 86_400_000 },
+]
+
+function toDatetimeLocal(d: Date) {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function DateRangePicker({ value, onChange }: { value: DateRange; onChange: (r: DateRange) => void }) {
+  const [open, setOpen] = useState(false)
+  const [customFrom, setCustomFrom] = useState(() => toDatetimeLocal(value.from))
+  const [customTo, setCustomTo] = useState(() => toDatetimeLocal(value.to))
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [])
+
+  function applyPreset(ms: number, label: string) {
+    const to = new Date()
+    const from = new Date(to.getTime() - ms)
+    onChange({ from, to, label })
+    setCustomFrom(toDatetimeLocal(from))
+    setCustomTo(toDatetimeLocal(to))
+    setOpen(false)
+  }
+
+  function applyCustom() {
+    const from = new Date(customFrom)
+    const to = new Date(customTo)
+    if (isNaN(from.getTime()) || isNaN(to.getTime()) || from >= to) return
+    const diffMs = to.getTime() - from.getTime()
+    const days = Math.round(diffMs / 86_400_000)
+    const label = days < 1
+      ? `${Math.round(diffMs / 3_600_000)}h range`
+      : `${days}d range`
+    onChange({ from, to, label })
+    setOpen(false)
+  }
+
+  const minDate = toDatetimeLocal(new Date(Date.now() - 3 * 365 * 86_400_000))
+  const maxDate = toDatetimeLocal(new Date())
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="mono text-[11px] px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+        style={{ background: open ? a(C.cyan, 0.12) : C.card, border: `1px solid ${open ? a(C.cyan, 0.35) : C.border}`, color: open ? C.cyan : C.dim }}
+      >
+        <span style={{ color: C.faint }}>⏱</span>
+        <span>{value.label}</span>
+        <span className="mono text-[8px]" style={{ color: C.faint }}>▼</span>
+      </button>
+      {open && (
+        <div
+          className="absolute right-0 top-full mt-1 z-50 rounded overflow-hidden"
+          style={{ background: C.card, border: `1px solid ${C.border}`, width: 500, boxShadow: `0 8px 32px ${a(C.bgDeep, 0.85)}` }}
+        >
+          <div className="flex" style={{ minHeight: 320 }}>
+            {/* Presets */}
+            <div className="flex flex-col flex-shrink-0" style={{ width: 180, borderRight: `1px solid ${C.border}` }}>
+              <div className="mono text-[9px] uppercase tracking-widest px-3 py-2" style={{ color: C.faint, borderBottom: `1px solid ${C.border}` }}>Quick ranges</div>
+              {RANGE_PRESETS.map(p => {
+                const active = value.label === p.label
+                return (
+                  <button
+                    key={p.label}
+                    onClick={() => applyPreset(p.ms, p.label)}
+                    className="mono text-[11px] text-left px-3 py-1.5 transition-colors"
+                    style={{ color: active ? C.cyan : C.dim, background: active ? a(C.cyan, 0.08) : 'transparent' }}
+                  >
+                    {active && <span className="mr-1">›</span>}{p.label}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Custom range inputs */}
+            <div className="flex flex-col flex-1 p-4 gap-4">
+              <div className="mono text-[9px] uppercase tracking-widest" style={{ color: C.faint }}>Custom range</div>
+              <label className="flex flex-col gap-1.5">
+                <span className="mono text-[10px]" style={{ color: C.dim }}>From</span>
+                <input
+                  type="datetime-local"
+                  value={customFrom}
+                  min={minDate}
+                  max={customTo || maxDate}
+                  onChange={e => setCustomFrom(e.target.value)}
+                  className="mono text-[11px] px-2 py-1.5 rounded outline-none"
+                  style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }}
+                />
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <span className="mono text-[10px]" style={{ color: C.dim }}>To</span>
+                <input
+                  type="datetime-local"
+                  value={customTo}
+                  min={customFrom}
+                  max={maxDate}
+                  onChange={e => setCustomTo(e.target.value)}
+                  className="mono text-[11px] px-2 py-1.5 rounded outline-none"
+                  style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }}
+                />
+              </label>
+              <button
+                onClick={applyCustom}
+                className="mono text-[11px] px-3 py-2 rounded transition-colors"
+                style={{ background: a(C.cyan, 0.15), border: `1px solid ${a(C.cyan, 0.3)}`, color: C.cyan }}
+              >
+                Apply range
+              </button>
+              <div className="mono text-[9px] mt-auto" style={{ color: C.faint }}>
+                {value.from.toLocaleString()} → {value.to.toLocaleString()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function TimeWindowPicker({ value, onChange }: { value: TimeWindow; onChange: (w: TimeWindow) => void }) {
   return (
     <div className="flex items-center rounded overflow-hidden" style={{ border: `1px solid ${C.border}`, background: C.card }}>
@@ -1159,17 +1315,48 @@ const FINGERPRINTS: { fp: string; dom: DomainId; svc: string; count: number; fir
   { fp: 'ERR-cert-expired-mtls', dom: 'ssa', svc: 'camera-analytics', count: 198, first: '2h ago', last: '6m ago', trend: '↑', also: ['mps'] },
 ]
 
-function ErrorsSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void }) {
+function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow }: { logs: LogEntry[]; domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void }) {
   const PIE_COLORS = [C.red, C.orange, C.amber, C.cyan, C.purple, C.green, C.dim]
   const dist = ERROR_DIST_BY_DOMAIN[domain]
+  const [selectedCell, setSelectedCell] = useState<{ day: number; hr: number } | null>(null)
 
-  const heatmap = Array.from({ length: 7 }, (_, day) =>
+  const heatmap = useMemo(() => Array.from({ length: 7 }, (_, day) =>
     Array.from({ length: 24 }, (_, hr) => ({
       day, hr,
-      val: Math.floor(Math.random() * 120 + (day === 2 && (hr >= 15 && hr <= 17) ? 300 : 0)),
+      val: Math.floor(seeded(`hm-${day}`, hr) * 120 + (day === 2 && (hr >= 15 && hr <= 17) ? 300 : 0)),
     }))
-  )
+  ), [])
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+  // Build error trend data scaled to the selected date range
+  const trendData = useMemo(() => {
+    const p2 = (n: number) => String(n).padStart(2, '0')
+    const toTime = dateRange ? dateRange.to.getTime() : Date.now()
+    const fromTime = dateRange ? dateRange.from.getTime() : toTime - TIME_WINDOW_MS[timeWindow ?? '1h']
+    const totalMs = toTime - fromTime
+
+    type CfgEntry = { points: number; stepMs: number; fmt: (d: Date) => string }
+    const cfg: CfgEntry = (() => {
+      const MONTH = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+      if (totalMs <= 10 * 60_000)      return { points: 12, stepMs: totalMs / 12, fmt: d => `${p2(d.getMinutes())}:${p2(d.getSeconds())}` }
+      if (totalMs <= 3_600_000)         return { points: 12, stepMs: totalMs / 12, fmt: d => `${p2(d.getHours())}:${p2(d.getMinutes())}` }
+      if (totalMs <= 86_400_000)        return { points: 24, stepMs: totalMs / 24, fmt: d => `${p2(d.getHours())}:00` }
+      if (totalMs <= 7 * 86_400_000)    return { points: 28, stepMs: totalMs / 28, fmt: d => `${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]} ${p2(d.getHours())}h` }
+      if (totalMs <= 90 * 86_400_000)   return { points: 30, stepMs: totalMs / 30, fmt: d => `${p2(d.getMonth()+1)}/${p2(d.getDate())}` }
+      return { points: 36, stepMs: totalMs / 36, fmt: d => `${MONTH[d.getMonth()]} ${d.getFullYear()}` }
+    })()
+
+    const key = `${fromTime}-${toTime}`
+    return Array.from({ length: cfg.points }, (_, i) => {
+      const t = new Date(fromTime + i * cfg.stepMs)
+      const base = 150 + Math.sin(i * 0.7) * 60
+      return {
+        time: cfg.fmt(t),
+        errors: Math.floor((base + seeded(`tw-err-${key}`, i) * 80) * (0.08 + seeded(`tw-em-${key}`, i) * 0.04)),
+        warns:  Math.floor((base + seeded(`tw-warn-${key}`, i) * 80) * (0.14 + seeded(`tw-wm-${key}`, i) * 0.06)),
+      }
+    })
+  }, [dateRange, timeWindow])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -1200,9 +1387,9 @@ function ErrorsSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFi
 
         {/* Trend */}
         <div className="card p-4">
-          <SectionHeader title="Error Trend" sub="hourly" />
+          <SectionHeader title="Error Trend" sub={dateRange?.label ?? `last ${timeWindow ?? '1h'}`} />
           <ResponsiveContainer width="100%" height={180}>
-            <LineChart data={VOLUME_DATA}>
+            <LineChart data={trendData}>
               <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
               <XAxis dataKey="time" tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} />
               <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={36} />
@@ -1229,6 +1416,7 @@ function ErrorsSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFi
               <div className="mono text-[9px] text-[var(--c-dim)] w-8 flex-shrink-0">{DAYS[d]}</div>
               {row.map((cell) => {
                 const intensity = cell.val / 420
+                const isSelected = selectedCell?.day === cell.day && selectedCell?.hr === cell.hr
                 const bg = intensity > 0.7 ? a(C.red, intensity) :
                   intensity > 0.4 ? a(C.orange, intensity + 0.1) :
                     intensity > 0.1 ? a(C.amber, intensity + 0.1) :
@@ -1237,8 +1425,13 @@ function ErrorsSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFi
                   <div
                     key={cell.hr}
                     title={`${DAYS[d]} ${cell.hr}:00 — ${cell.val} errors`}
+                    onClick={() => setSelectedCell(isSelected ? null : { day: cell.day, hr: cell.hr })}
                     className="flex-1 rounded-sm cursor-pointer"
-                    style={{ height: 16, minWidth: 18, background: bg }}
+                    style={{
+                      height: 16, minWidth: 18, background: bg,
+                      outline: isSelected ? `2px solid ${C.cyan}` : undefined,
+                      outlineOffset: 1,
+                    }}
                   />
                 )
               })}
@@ -1254,46 +1447,54 @@ function ErrorsSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFi
         </div>
       </div>
 
-      {/* Top errors table */}
+      {/* Selected block logs */}
       <div className="card p-4">
-        <SectionHeader title="Top Error Fingerprints" sub="deduplicated · cross-tenant matches flagged" />
-        <table className="w-full text-[11px] mono">
-          <thead>
-            <tr className="text-[var(--c-faint)] text-[10px] uppercase tracking-widest border-b border-[var(--c-border)]">
-              <th className="text-left pb-2 font-medium">Fingerprint</th>
-              <th className="text-left pb-2 font-medium">Tenant</th>
-              <th className="text-left pb-2 font-medium">Service</th>
-              <th className="text-right pb-2 font-medium">Count</th>
-              <th className="text-right pb-2 font-medium">First Seen</th>
-              <th className="text-right pb-2 font-medium">Last Seen</th>
-              <th className="text-right pb-2 font-medium">Trend</th>
-            </tr>
-          </thead>
-          <tbody>
-            {FINGERPRINTS.filter(f => f.dom === domain).map(({ fp, dom, svc, count, first, last, trend, also }) => (
-              <tr key={fp} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
-                <td className="py-2 text-[var(--c-text)]">
-                  {fp}
-                  {also.length > 0 && (
-                    <span className="ml-2 mono text-[9px] px-1 rounded" style={{ background: a(C.purple, 0.12), color: C.purple }}>
-                      also in {also.map(d => DOMAIN_BY_ID[d].short).join(', ')}
-                    </span>
-                  )}
-                </td>
-                <td className="py-2">
-                  <span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(dom), 0.14), color: domainColor(dom) }}>{DOMAIN_BY_ID[dom].short}</span>
-                </td>
-                <td className="py-2 text-[var(--c-cyan)]">{svc}</td>
-                <td className="py-2 text-right text-[var(--c-red)]">{count.toLocaleString()}</td>
-                <td className="py-2 text-right text-[var(--c-faint)]">{first}</td>
-                <td className="py-2 text-right text-[var(--c-dim)]">{last}</td>
-                <td className={`py-2 text-right font-bold ${trend === '↑' ? 'text-[var(--c-red)]' : trend === '↓' ? 'text-[var(--c-green)]' : 'text-[var(--c-amber)]'}`}>
-                  {trend}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        {selectedCell ? (
+          <>
+            <SectionHeader
+              title="Errors"
+              sub={`${DAYS[selectedCell.day]} ${String(selectedCell.hr).padStart(2, '0')}:00 — ${String(selectedCell.hr).padStart(2, '0')}:59 · click a cell to change selection`}
+            />
+            {(() => {
+              const cellLogs = logs
+                .filter(l => ['ERROR', 'CRITICAL'].includes(l.severity))
+                .filter(l => new Date(l.timestamp).getHours() === selectedCell.hr)
+                .slice(0, 50)
+              const cols = '140px 70px 150px 1fr 60px'
+              return cellLogs.length === 0 ? (
+                <p className="mono text-[11px] text-[var(--c-faint)] mt-3">No error logs for this time slot.</p>
+              ) : (
+                <div className="flex flex-col gap-px mt-3 max-h-64 overflow-auto">
+                  <div className="mono text-[10px] text-[var(--c-faint)] grid gap-2 px-2 uppercase tracking-widest mb-1" style={{ gridTemplateColumns: cols }}>
+                    <span>Timestamp</span><span>Level</span><span>Service</span><span>Message</span><span className="text-right">Status</span>
+                  </div>
+                  {cellLogs.map((log, i) => (
+                    <div
+                      key={log.id}
+                      className="mono text-[11px] grid gap-2 px-2 py-1 rounded"
+                      style={{
+                        gridTemplateColumns: cols,
+                        background: i % 2 === 0 ? 'transparent' : a(C.text, 0.012),
+                        borderLeft: `2px solid ${SEV_COLOR()[log.severity]}40`,
+                      }}
+                    >
+                      <span className="text-[var(--c-faint)] truncate">{log.timestamp.replace('T', ' ').slice(0, 19)}</span>
+                      <span style={{ color: SEV_COLOR()[log.severity] }}>{log.severity}</span>
+                      <span className="text-[var(--c-cyan)] truncate">{log.service}</span>
+                      <span className="text-[var(--c-text)] truncate">{log.message}</span>
+                      <span className="text-right" style={{ color: log.statusCode && log.statusCode >= 500 ? C.red : C.dim }}>{log.statusCode}</span>
+                    </div>
+                  ))}
+                </div>
+              )
+            })()}
+          </>
+        ) : (
+          <>
+            <SectionHeader title="Errors" sub="click a heatmap block to inspect logs for that hour" />
+            <p className="mono text-[11px] text-[var(--c-faint)] mt-3">Select a block in the heatmap above to view its error logs here.</p>
+          </>
+        )}
       </div>
     </div>
   )
@@ -1438,13 +1639,6 @@ function RCASection({ domain, setDomain, timeWindow = '1h', setTimeWindow }: { d
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
-      {/* Time window control */}
-      <div className="flex items-center gap-3">
-        <span className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest">Analysis window</span>
-        <TimeWindowPicker value={timeWindow} onChange={setTimeWindow ?? (() => {})} />
-        <span className="mono text-[10px] text-[var(--c-dim)]">sliding · {DOMAIN_BY_ID[domain]?.label ?? domain}</span>
-      </div>
-
       {/* Cross-LoB blast radius */}
       <div className="card p-4">
         <div className="flex items-baseline gap-3 mb-3 flex-wrap">
@@ -3280,9 +3474,6 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
             </button>
           ))}
         </div>
-        <div className="ml-auto">
-          <TimeWindowPicker value={timeWindow ?? '1h'} onChange={setTimeWindow ?? (() => {})} />
-        </div>
       </div>
 
       {/* Summary banner */}
@@ -3297,10 +3488,6 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
             </span>
           </div>
           <p className="mono text-[11px] text-[var(--c-dim)]">{profile.posture}</p>
-        </div>
-        <div className="mono text-[10px] text-[var(--c-faint)] text-right flex-shrink-0">
-          <div>{d.policy.residency}</div>
-          <div>{d.policy.regime}</div>
         </div>
       </div>
 
@@ -3388,11 +3575,6 @@ function SLASection({ domain, timeWindow, setTimeWindow }: {
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
-      <div className="flex items-center gap-3">
-        <span className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest">Window</span>
-        <TimeWindowPicker value={timeWindow ?? '24h'} onChange={setTimeWindow ?? (() => {})} />
-      </div>
-
       {/* SLA matrix */}
       <div className="card p-4">
         <SectionHeader title="SLA Attainment" sub={`all LoBs · ${timeWindow ?? '24h'}`} />
@@ -3888,7 +4070,18 @@ export default function App() {
   const [section, setSection] = useState<NavSection>('lob')
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS)
   const [live, setLive] = useState(true)
-  const [timeWindow, setTimeWindow] = useState<TimeWindow>('1h')
+  const [dateRange, setDateRange] = useState<DateRange>(() => {
+    const to = new Date()
+    const from = new Date(to.getTime() - 3_600_000)
+    return { from, to, label: 'Last 1 hour' }
+  })
+  const timeWindow: TimeWindow = dateRangeToTimeWindow(dateRange)
+  // compat shim so internal section pickers can still call setTimeWindow(w)
+  const setTimeWindow = (w: TimeWindow) => {
+    const ms = TIME_WINDOW_MS[w]
+    const to = new Date()
+    setDateRange({ from: new Date(to.getTime() - ms), to, label: TIME_WINDOWS.find(t => t.id === w)?.label ?? w })
+  }
   const [model, setModel] = useState('claude-sonnet-5')
   const [customAgents, setCustomAgents] = useState<CustomAgentDef[]>([])
   const [domain, setDomain] = useState<DomainFilter>('mps')
@@ -4062,8 +4255,8 @@ export default function App() {
             </div>
           </div>
 
-          {/* Global time window — applies to all charts */}
-          <TimeWindowPicker value={timeWindow} onChange={setTimeWindow} />
+          {/* Global date range — applies to all charts */}
+          <DateRangePicker value={dateRange} onChange={setDateRange} />
 
           {/* Theme switch: system / dark / light */}
           <div className="flex items-center rounded overflow-hidden" style={{ border: `1px solid ${C.border}`, background: C.card }}>
@@ -4105,12 +4298,6 @@ export default function App() {
             <span>{currentModel.icon}</span>
             <span>{currentModel.name}</span>
           </div>
-
-          {/* Alert indicator */}
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded" style={{ background: a(C.red,0.08), border: `1px solid ${a(C.red,0.2)}` }}>
-            <div className="w-1.5 h-1.5 rounded-full animate-pulse-dot" style={{ background: C.red }} />
-            <span className="mono text-[10px] text-[var(--c-red)]">P1 INC-2847</span>
-          </div>
         </header>
 
         {/* LoB bar — scopes every section below */}
@@ -4139,9 +4326,6 @@ export default function App() {
             )
           })}
           <div className="ml-auto flex items-center gap-2 flex-shrink-0">
-            <span className="mono text-[10px] text-[var(--c-faint)]">
-              {`${DOMAIN_BY_ID[domain].policy.residency} · ${DOMAIN_BY_ID[domain].policy.retention}`}
-            </span>
           </div>
         </div>
 
@@ -4151,7 +4335,7 @@ export default function App() {
             <LobSection logs={activeLogs} domain={domain} setDomain={setDomain} esServices={source === 'elastic' ? es.services : undefined} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
           )}
           {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={domain} />}
-          {section === 'errors' && <ErrorsSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
+          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
           {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
           {section === 'sla' && <SLASection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
           {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={domain} setDomain={setDomain} />}
