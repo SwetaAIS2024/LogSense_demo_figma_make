@@ -5,7 +5,7 @@ import {
   Scatter, ReferenceLine, Legend
 } from 'recharts'
 import type { DomainDef, DomainFilter, DomainId, LogEntry, Severity } from '@/lib/types'
-import { ES_BASE, ES_TENANTS, type ServiceRollup } from '@/lib/elastic'
+import { ES_BASE, ES_TENANTS, setEsRuntimeConfig, setEsTenantIndex, type ServiceRollup, type VolumeBucket, type ErrorTypeBucket } from '@/lib/elastic'
 import { useElasticStream, type EsState } from '@/lib/useElastic'
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ function usePrefersDark() {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type DataSource = 'demo' | 'elastic'
+type DataSource = 'demo' | 'elastic' | 'file'
 type NavSection = 'lob' | 'logs' | 'errors' | 'anomalies' | 'sla' | 'rca' | 'agent' | 'pipeline'
 type TimeWindow = '1m' | '5m' | '15m' | '1h' | '6h' | '24h' | '7d'
 type DateRange = { from: Date; to: Date; label: string }
@@ -485,17 +485,31 @@ const PIPELINE_STAGES = [
   { id: 'alert', label: 'Alert', icon: '⚡', rate: '124/s', status: 'ok', latency: '0.4ms', note: 'burn-rate routed' },
 ]
 
-/** 24h error-budget burn per tenant. 1× is the sustainable rate; >6× pages. */
-const BURN_TREND = Array.from({ length: 24 }, (_, i) => {
-  const h = (new Date().getHours() - 23 + i + 24) % 24
-  const row: Record<string, number | string> = { time: `${String(h).padStart(2, '0')}:00` }
-  for (const d of DEMO_DOMAINS) {
-    const ramp = (i / 23) ** 2
-    const noise = (seeded('burn' + d.id, i) - 0.5) * 0.7
-    row[d.id] = Number(Math.max(0.05, d.slo.burn * (0.3 + 0.7 * ramp) + noise).toFixed(2))
-  }
-  return row
-})
+/** Generate burn-rate trend data spanning the given time range. */
+function makeBurnTrend(fromTime: number, toTime: number) {
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const totalMs = toTime - fromTime
+  const MONTH = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const { points, stepMs, fmt } = (() => {
+    if (totalMs <= 10 * 60_000)     return { points: 12, stepMs: totalMs / 12, fmt: (d: Date) => `${p2(d.getMinutes())}:${p2(d.getSeconds())}` }
+    if (totalMs <= 3_600_000)        return { points: 12, stepMs: totalMs / 12, fmt: (d: Date) => `${p2(d.getHours())}:${p2(d.getMinutes())}` }
+    if (totalMs <= 86_400_000)       return { points: 24, stepMs: totalMs / 24, fmt: (d: Date) => `${p2(d.getHours())}:00` }
+    if (totalMs <= 7 * 86_400_000)   return { points: 28, stepMs: totalMs / 28, fmt: (d: Date) => `${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]} ${p2(d.getHours())}h` }
+    if (totalMs <= 90 * 86_400_000)  return { points: 30, stepMs: totalMs / 30, fmt: (d: Date) => `${p2(d.getMonth()+1)}/${p2(d.getDate())}` }
+    return { points: 36, stepMs: totalMs / 36, fmt: (d: Date) => `${MONTH[d.getMonth()]} ${d.getFullYear()}` }
+  })()
+  const key = `${fromTime}`
+  return Array.from({ length: points }, (_, i) => {
+    const t = new Date(fromTime + i * stepMs)
+    const ramp = (i / (points - 1)) ** 2
+    const row: Record<string, number | string> = { time: fmt(t) }
+    for (const d of DEMO_DOMAINS) {
+      const noise = (seeded(`burn-${key}-${d.id}`, i) - 0.5) * 0.7
+      row[d.id] = Number(Math.max(0.05, d.slo.burn * (0.3 + 0.7 * ramp) + noise).toFixed(2))
+    }
+    return row
+  })
+}
 
 // ─── Per-team system model ────────────────────────────────────────────────────
 // The estate each team actually operates: what runs, what it depends on, who is
@@ -969,8 +983,8 @@ function SloBar({ attainment, target, burn }: { attainment: number; target: stri
   )
 }
 
-function DomainHealthMatrix({ logs, domain, setDomain }: {
-  logs: LogEntry[]; domain: DomainFilter; setDomain: (d: DomainFilter) => void
+function DomainHealthMatrix({ logs, domain, setDomain, dateRange }: {
+  logs: LogEntry[]; domain: DomainFilter; setDomain: (d: DomainFilter) => void; dateRange?: DateRange
 }) {
   return (
     <div className="card p-4">
@@ -1092,7 +1106,7 @@ function OverviewSection({ logs, domain, setDomain, volumeData, errorDist }: {
       <div className="card p-4 flex-shrink-0">
         <SectionHeader title="Error-Budget Burn Trend" sub="24h · multiples of the sustainable rate · >6× pages on-call" />
         <ResponsiveContainer width="100%" height={190}>
-          <LineChart data={BURN_TREND} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
+          <LineChart data={makeBurnTrend(Date.now() - 86_400_000, Date.now())} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
             <XAxis dataKey="time" tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} interval={3} />
             <YAxis
@@ -1187,7 +1201,11 @@ function LogsSection({ logs, live, domain }: { logs: LogEntry[], live: boolean, 
   const [sevFilter, setSevFilter] = useState<Severity | 'ALL'>('ALL')
   const [svcFilter, setSvcFilter] = useState('ALL')
   const [showRaw, setShowRaw] = useState(false)
+  const [scrollTop, setScrollTop] = useState(0)
   const ref = useRef<HTMLDivElement>(null)
+
+  const ROW_H = 28
+  const OVERSCAN = 30
 
   // Service list follows the tenant in scope — a payments engineer should never
   // have to scroll past signalling services to find theirs.
@@ -1198,7 +1216,11 @@ function LogsSection({ logs, live, domain }: { logs: LogEntry[], live: boolean, 
     if (svcFilter !== 'ALL' && l.service !== svcFilter) return false
     if (filter && !l.message.toLowerCase().includes(filter.toLowerCase()) && !l.service.includes(filter)) return false
     return true
-  }).slice(0, 300)
+  })
+
+  const viewportH = ref.current?.clientHeight ?? 600
+  const vStart = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN)
+  const vEnd = Math.min(filtered.length, Math.ceil((scrollTop + viewportH) / ROW_H) + OVERSCAN)
 
   useEffect(() => {
     if (live && ref.current) ref.current.scrollTop = 0
@@ -1246,7 +1268,7 @@ function LogsSection({ logs, live, domain }: { logs: LogEntry[], live: boolean, 
         >
           agent view
         </button>
-        <div className="mono text-[11px] text-[var(--c-faint)] flex items-center px-2">{filtered.length} entries</div>
+        <div className="mono text-[11px] text-[var(--c-faint)] flex items-center px-2">{filtered.length.toLocaleString()} entries</div>
       </div>
 
       {/* Column headers */}
@@ -1261,34 +1283,43 @@ function LogsSection({ logs, live, domain }: { logs: LogEntry[], live: boolean, 
         <span className="text-right">Status</span>
       </div>
 
-      {/* Log rows */}
-      <div ref={ref} className="flex-1 overflow-auto min-h-0 flex flex-col gap-px">
-        {filtered.map((log, i) => (
-          <div
-            key={log.id}
-            className="log-row mono text-[11px] grid gap-2 px-2 py-1 rounded cursor-default"
-            style={{
-              gridTemplateColumns: cols,
-              background: i % 2 === 0 ? 'transparent' : a(C.text, 0.012),
-              borderLeft: ['CRITICAL', 'ERROR'].includes(log.severity) ? `2px solid ${SEV_COLOR()[log.severity]}40` : '2px solid transparent',
-            }}
-          >
-            <span className="text-[var(--c-faint)] truncate">{log.timestamp.replace('T', ' ').slice(0, 19)}</span>
-            <span className="text-[9px] px-1 rounded self-center justify-self-start"
-              style={{ background: a(domainColor(log.domain), 0.14), color: domainColor(log.domain) }}>
-              {DOMAIN_BY_ID[log.domain].short}
-            </span>
-            <SeverityBadge sev={log.severity} />
-            <span className="text-[var(--c-cyan)] truncate">{log.service}</span>
-            <span className="text-[var(--c-text2)] truncate">
-              {showRaw ? redactForAgent(log.message) : log.message}
-            </span>
-            <span className="text-[var(--c-faint)] truncate">{log.traceId}</span>
-            <span className="text-right" style={{ color: (log.statusCode || 200) >= 500 ? C.red : C.green }}>
-              {log.statusCode || '—'}
-            </span>
+      {/* Log rows — virtual scroll: only visible rows are in the DOM */}
+      <div
+        ref={ref}
+        className="flex-1 overflow-auto min-h-0"
+        onScroll={e => setScrollTop(e.currentTarget.scrollTop)}
+      >
+        <div style={{ height: filtered.length * ROW_H, position: 'relative' }}>
+          <div style={{ position: 'absolute', top: vStart * ROW_H, width: '100%', display: 'flex', flexDirection: 'column', gap: 1 }}>
+            {filtered.slice(vStart, vEnd).map((log, i) => (
+              <div
+                key={log.id}
+                className="log-row mono text-[11px] grid gap-2 px-2 py-1 rounded cursor-default"
+                style={{
+                  gridTemplateColumns: cols,
+                  height: ROW_H,
+                  background: (vStart + i) % 2 === 0 ? 'transparent' : a(C.text, 0.012),
+                  borderLeft: ['CRITICAL', 'ERROR'].includes(log.severity) ? `2px solid ${SEV_COLOR()[log.severity]}40` : '2px solid transparent',
+                }}
+              >
+                <span className="text-[var(--c-faint)] truncate">{log.timestamp.replace('T', ' ').slice(0, 19)}</span>
+                <span className="text-[9px] px-1 rounded self-center justify-self-start"
+                  style={{ background: a(domainColor(log.domain), 0.14), color: domainColor(log.domain) }}>
+                  {DOMAIN_BY_ID[log.domain].short}
+                </span>
+                <SeverityBadge sev={log.severity} />
+                <span className="text-[var(--c-cyan)] truncate">{log.service}</span>
+                <span className="text-[var(--c-text2)] truncate">
+                  {showRaw ? redactForAgent(log.message) : log.message}
+                </span>
+                <span className="text-[var(--c-faint)] truncate">{log.traceId}</span>
+                <span className="text-right" style={{ color: (log.statusCode || 200) >= 500 ? C.red : C.green }}>
+                  {log.statusCode || '—'}
+                </span>
+              </div>
+            ))}
           </div>
-        ))}
+        </div>
       </div>
     </div>
   )
@@ -1315,26 +1346,46 @@ const FINGERPRINTS: { fp: string; dom: DomainId; svc: string; count: number; fir
   { fp: 'ERR-cert-expired-mtls', dom: 'ssa', svc: 'camera-analytics', count: 198, first: '2h ago', last: '6m ago', trend: '↑', also: ['mps'] },
 ]
 
-function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow }: { logs: LogEntry[]; domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void }) {
+function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow, esErrorTypes, esVolume }: { logs: LogEntry[]; domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esErrorTypes?: ErrorTypeBucket[]; esVolume?: VolumeBucket[] }) {
   const PIE_COLORS = [C.red, C.orange, C.amber, C.cyan, C.purple, C.green, C.dim]
-  const dist = ERROR_DIST_BY_DOMAIN[domain]
+  const dist = esErrorTypes?.length ? esErrorTypes : ERROR_DIST_BY_DOMAIN[domain]
   const [selectedCell, setSelectedCell] = useState<{ day: number; hr: number } | null>(null)
 
-  const heatmap = useMemo(() => Array.from({ length: 7 }, (_, day) =>
-    Array.from({ length: 24 }, (_, hr) => ({
-      day, hr,
-      val: Math.floor(seeded(`hm-${day}`, hr) * 120 + (day === 2 && (hr >= 15 && hr <= 17) ? 300 : 0)),
-    }))
-  ), [])
+  // Heatmap: derive from real log timestamps when available, else use seeded demo values.
+  const heatmap = useMemo(() => {
+    const errorLogs = logs.filter(l => l.severity === 'CRITICAL' || l.severity === 'ERROR')
+    if (errorLogs.length > 0) {
+      const grid = Array.from({ length: 7 }, () => Array(24).fill(0))
+      for (const log of errorLogs) {
+        const d = new Date(log.timestamp)
+        const dayOfWeek = (d.getDay() + 6) % 7 // Mon=0 … Sun=6
+        grid[dayOfWeek][d.getHours()]++
+      }
+      const max = Math.max(1, ...grid.flat())
+      return Array.from({ length: 7 }, (_, day) =>
+        Array.from({ length: 24 }, (_, hr) => ({
+          day, hr, val: Math.round((grid[day][hr] / max) * 420),
+        }))
+      )
+    }
+    return Array.from({ length: 7 }, (_, day) =>
+      Array.from({ length: 24 }, (_, hr) => ({
+        day, hr,
+        val: Math.floor(seeded(`hm-${day}`, hr) * 120 + (day === 2 && (hr >= 15 && hr <= 17) ? 300 : 0)),
+      }))
+    )
+  }, [logs])
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
-  // Build error trend data scaled to the selected date range
+  // Trend: use real ES volume buckets when available, else synthetic seeded data.
   const trendData = useMemo(() => {
+    if (esVolume?.length) {
+      return esVolume.map(b => ({ time: b.time, errors: b.errors, warns: b.warns }))
+    }
     const p2 = (n: number) => String(n).padStart(2, '0')
     const toTime = dateRange ? dateRange.to.getTime() : Date.now()
     const fromTime = dateRange ? dateRange.from.getTime() : toTime - TIME_WINDOW_MS[timeWindow ?? '1h']
     const totalMs = toTime - fromTime
-
     type CfgEntry = { points: number; stepMs: number; fmt: (d: Date) => string }
     const cfg: CfgEntry = (() => {
       const MONTH = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
@@ -1345,7 +1396,6 @@ function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow }: {
       if (totalMs <= 90 * 86_400_000)   return { points: 30, stepMs: totalMs / 30, fmt: d => `${p2(d.getMonth()+1)}/${p2(d.getDate())}` }
       return { points: 36, stepMs: totalMs / 36, fmt: d => `${MONTH[d.getMonth()]} ${d.getFullYear()}` }
     })()
-
     const key = `${fromTime}-${toTime}`
     return Array.from({ length: cfg.points }, (_, i) => {
       const t = new Date(fromTime + i * cfg.stepMs)
@@ -1356,14 +1406,14 @@ function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow }: {
         warns:  Math.floor((base + seeded(`tw-warn-${key}`, i) * 80) * (0.14 + seeded(`tw-wm-${key}`, i) * 0.06)),
       }
     })
-  }, [dateRange, timeWindow])
+  }, [dateRange, timeWindow, esVolume])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Pie */}
         <div className="card p-4">
-          <SectionHeader title="Error Type Distribution" />
+          <SectionHeader title="Error Distribution" sub={esErrorTypes?.length && esErrorTypes[0]?.name !== 'Uncategorised' ? 'by error type' : 'by service'} />
           <div className="flex gap-4 items-center">
             <ResponsiveContainer width={180} height={180}>
               <PieChart>
@@ -1510,9 +1560,24 @@ const ANOMALIES: { time: string; dom: DomainId; type: string; service: string; s
   { time: 'Yesterday 22:10', dom: 'mps', type: 'Error Burst', service: 'fraud-scoring', score: 0.79, detail: '142 auth failures in 90s — suspected credential stuffing', status: 'Closed', baseline: 'seasonal, 28d' },
 ]
 
-function AnomalySection({ domain, timeWindow, setTimeWindow }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void }) {
+function AnomalySection({ domain, timeWindow, setTimeWindow, esVolume }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esVolume?: VolumeBucket[] }) {
   const [threshold] = useState(300)
   const rows = ANOMALIES.filter(r => r.dom === domain)
+
+  // Use real error volume as the anomaly timeline baseline when available.
+  const chartData = useMemo(() => {
+    if (esVolume?.length) {
+      const max = Math.max(1, ...esVolume.map(b => b.errors))
+      return esVolume.map((b, i) => ({
+        t: i,
+        value: b.errors,
+        upper: Math.round(max * 1.3),
+        lower: 0,
+        anomaly: b.errors > max * 0.7,
+      }))
+    }
+    return ANOMALY_DATA
+  }, [esVolume])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -1523,9 +1588,9 @@ function AnomalySection({ domain, timeWindow, setTimeWindow }: { domain: DomainF
       </div>
 
       <div className="card p-4">
-        <SectionHeader title="Anomaly Timeline" sub="request rate with ML-detected anomalies" />
+        <SectionHeader title="Anomaly Timeline" sub={esVolume?.length ? 'real error volume · ML-detected spikes' : 'request rate with ML-detected anomalies'} />
         <ResponsiveContainer width="100%" height={220}>
-          <AreaChart data={ANOMALY_DATA} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+          <AreaChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
             <defs>
               <linearGradient id="gNorm" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor={C.cyan} stopOpacity={0.1} />
@@ -2857,17 +2922,28 @@ function AgentSection({ model, setModel, domain, setDomain }: {
   )
 }
 
-function PipelineSection({ domain, timeWindow, setTimeWindow }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void }) {
+function PipelineSection({ domain, timeWindow, setTimeWindow, esServices }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esServices?: Record<string, ServiceRollup[]> }) {
   const [tick, setTick] = useState(0)
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000)
     return () => clearInterval(id)
   }, [])
 
-  const throughput = Array.from({ length: 30 }, (_, i) => ({
-    t: i,
-    rate: Math.floor(280000 + Math.sin(i * 0.5) * 15000 + Math.random() * 8000),
-  }))
+  // Use real per-service event rates for throughput when available.
+  const throughput = useMemo(() => {
+    const rollup = esServices?.[domain]
+    if (rollup?.length) {
+      const totalPerMin = rollup.reduce((n, s) => n + s.events, 0)
+      return Array.from({ length: 30 }, (_, i) => ({
+        t: i,
+        rate: Math.round(totalPerMin / 60 * (1 + (seeded('pipe', i) - 0.5) * 0.1)),
+      }))
+    }
+    return Array.from({ length: 30 }, (_, i) => ({
+      t: i,
+      rate: Math.floor(280000 + Math.sin(i * 0.5) * 15000 + Math.random() * 8000),
+    }))
+  }, [esServices, domain, tick])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -2963,8 +3039,12 @@ function PipelineSection({ domain, timeWindow, setTimeWindow }: { domain: Domain
           </thead>
           <tbody>
             {DOMAINS.filter(d => d.id === domain).map(d => {
-              const used = d.share * 284
-              const quota = d.share * 284 * 1.4
+              const rollup = esServices?.[d.id]?.length ? esServices[d.id] : undefined
+              const usedEvPerSec = rollup
+                ? rollup.reduce((n, s) => n + s.events, 0) / 60
+                : d.share * 284
+              const used = usedEvPerSec
+              const quota = used * 1.4
               const pressure = used / quota
               return (
                 <tr key={d.id} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
@@ -3031,41 +3111,258 @@ function PipelineSection({ domain, timeWindow, setTimeWindow }: { domain: Domain
 // ─── Team system overview ─────────────────────────────────────────────────────
 
 /** Data-source switch plus live connection state for the Elastic backend. */
-function SourcePill({ source, setSource, es }: {
+// ─── Offline Upload Panel ─────────────────────────────────────────────────────
+
+const UPLOAD_BASE = import.meta.env.VITE_UPLOAD_URL || ''
+
+type UploadPhase = 'idle' | 'uploading' | 'processing' | 'ready' | 'error'
+
+const LS_UPLOAD_STATE = 'logsense-upload-state'
+
+function saveUploadState(s: { team: 'mps' | 'mrd'; phase: UploadPhase; progress: string; baselineCount: number; fromTs?: string; toTs?: string }) {
+  localStorage.setItem(LS_UPLOAD_STATE, JSON.stringify(s))
+}
+function clearUploadState() { localStorage.removeItem(LS_UPLOAD_STATE) }
+function loadUploadState(): { team: 'mps' | 'mrd'; phase: UploadPhase; progress: string; baselineCount: number; fromTs?: string; toTs?: string } | null {
+  try { const r = localStorage.getItem(LS_UPLOAD_STATE); return r ? JSON.parse(r) : null } catch { return null }
+}
+
+function OfflineUploadPanel({ onReady }: { onReady: (from: Date, to: Date) => void }) {
+  const saved = loadUploadState()
+  const [team, setTeam] = useState<'mps' | 'mrd'>(saved?.team ?? 'mps')
+  const [phase, setPhase] = useState<UploadPhase>(saved?.phase ?? 'idle')
+  const [progress, setProgress] = useState(saved?.progress ?? '')
+  const [docCount, setDocCount] = useState(0)
+  const [baselineCount, setBaselineCount] = useState<number | null>(saved?.baselineCount ?? null)
+  const [dragging, setDragging] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Resume polling if processing, or re-fire onReady if already done (e.g. after page reload).
+  useEffect(() => {
+    if (phase === 'processing') pollForDocs()
+    if (phase === 'ready' && saved?.fromTs && saved?.toTs) {
+      onReady(new Date(saved.fromTs), new Date(saved.toTs))
+    }
+    return stopPoll
+  }, [])
+
+  function stopPoll() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+  }
+
+  async function uploadFiles(files: FileList) {
+    if (!files.length) return
+    setPhase('uploading')
+    setProgress(`Uploading ${files.length} file(s)…`)
+
+    // Snapshot current doc count so we can detect new docs arriving.
+    let baseline = 0
+    try {
+      const snap = await fetch(`${UPLOAD_BASE}/status/${team}`)
+      const j = await snap.json()
+      baseline = j.docCount ?? 0
+    } catch {}
+    setBaselineCount(baseline)
+    saveUploadState({ team, phase: 'uploading', progress: `Uploading ${files.length} file(s)…`, baselineCount: baseline })
+
+    const fd = new FormData()
+    fd.append('team', team)
+    for (const f of Array.from(files)) fd.append('files', f)
+
+    try {
+      const res = await fetch(`${UPLOAD_BASE}/upload`, { method: 'POST', body: fd })
+      if (!res.ok) throw new Error(`Upload failed: ${res.status}`)
+      const msg = 'Files received by pipeline. Waiting for Logstash to index…'
+      setPhase('processing')
+      setProgress(msg)
+      saveUploadState({ team, phase: 'processing', progress: msg, baselineCount: baseline })
+      pollForDocs()
+    } catch (err) {
+      setPhase('error')
+      setProgress(String(err))
+      clearUploadState()
+    }
+  }
+
+  function pollForDocs() {
+    stopPoll()
+    let ticks = 0
+    pollRef.current = setInterval(async () => {
+      ticks++
+      try {
+        const res = await fetch(`${UPLOAD_BASE}/status/${team}`)
+        const j = await res.json()
+        const count: number = j.docCount ?? 0
+        setDocCount(count)
+        const newDocs = count - (baselineCount ?? 0)
+        const msg = newDocs > 0
+          ? `Indexed ${newDocs.toLocaleString()} new events…`
+          : `Logstash processing… (${ticks * 3}s elapsed)`
+        setProgress(msg)
+        saveUploadState({ team, phase: 'processing', progress: msg, baselineCount: baselineCount ?? 0 })
+
+        if (newDocs > 0 && ticks > 2) {
+          if (ticks > 4) {
+            stopPoll()
+            const doneMsg = `Done — ${newDocs.toLocaleString()} events indexed`
+            setPhase('ready')
+            setProgress(doneMsg)
+            saveUploadState({ team, phase: 'ready', progress: doneMsg, baselineCount: baselineCount ?? 0, fromTs: j.fromTs ?? undefined, toTs: j.toTs ?? undefined })
+            if (j.fromTs && j.toTs) onReady(new Date(j.fromTs), new Date(j.toTs))
+          }
+        }
+      } catch { /* network blip — keep polling */ }
+
+      if (ticks > 120) {
+        stopPoll()
+        const errMsg = 'Timed out waiting for Logstash. Check the pipeline containers.'
+        setPhase('error')
+        setProgress(errMsg)
+        clearUploadState()
+      }
+    }, 3000)
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault(); setDragging(false)
+    uploadFiles(e.dataTransfer.files)
+  }
+
+  const phaseColor = phase === 'ready' ? C.green : phase === 'error' ? C.red : phase === 'idle' ? C.faint : C.amber
+
+  return (
+    <div className="flex flex-col gap-3 p-1">
+      <div className="mono text-[9px] uppercase tracking-widest" style={{ color: C.faint }}>Offline Analysis</div>
+
+      {/* Team selector */}
+      <div className="flex gap-2">
+        {(['mps', 'mrd'] as const).map(t => (
+          <button key={t} onClick={() => setTeam(t)}
+            className="mono text-[10px] px-2 py-1 rounded uppercase"
+            style={{ background: team === t ? a(C.cyan, 0.14) : 'transparent', border: `1px solid ${team === t ? a(C.cyan, 0.4) : C.border}`, color: team === t ? C.cyan : C.dim }}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {/* Drop zone */}
+      <div
+        onDragOver={e => { e.preventDefault(); setDragging(true) }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+        onClick={() => { const i = document.createElement('input'); i.type = 'file'; i.multiple = true; i.onchange = () => i.files && uploadFiles(i.files); i.click() }}
+        className="rounded cursor-pointer flex flex-col items-center justify-center gap-1 py-4"
+        style={{ border: `1.5px dashed ${dragging ? C.cyan : C.border}`, background: dragging ? a(C.cyan, 0.05) : 'transparent' }}
+      >
+        <span className="text-lg" style={{ color: C.faint }}>⊕</span>
+        <span className="mono text-[10px]" style={{ color: C.dim }}>Drop log files here or click</span>
+        <span className="mono text-[9px]" style={{ color: C.faint }}>.log · .txt · .json · .zip</span>
+      </div>
+
+      {/* Status */}
+      {phase !== 'idle' && (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            {phase === 'processing' && <span className="animate-pulse-dot w-1.5 h-1.5 rounded-full" style={{ background: C.amber }} />}
+            {phase === 'ready' && <span style={{ color: C.green }}>✓</span>}
+            {phase === 'error' && <span style={{ color: C.red }}>✕</span>}
+            <span className="mono text-[10px] flex-1" style={{ color: phaseColor }}>{progress}</span>
+            <button onClick={() => { stopPoll(); setPhase('idle'); setProgress(''); setBaselineCount(null); clearUploadState() }}
+              className="mono text-[9px] px-1.5 py-0.5 rounded" style={{ color: C.faint, border: `1px solid ${C.border}` }}>
+              reset
+            </button>
+          </div>
+          {phase === 'processing' && (
+            <div className="h-1 rounded-full overflow-hidden" style={{ background: C.border }}>
+              <div className="h-full rounded-full animate-pulse" style={{ width: `${Math.min(95, (docCount > 0 ? 60 : 20))}%`, background: C.amber }} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const LS_ES_CONFIG = 'logsense-es-config'
+
+function loadEsConfig() {
+  try {
+    const raw = localStorage.getItem(LS_ES_CONFIG)
+    if (raw) return JSON.parse(raw) as { url: string; username: string; password: string; indices: Record<string, string> }
+  } catch {}
+  return null
+}
+
+function saveEsConfig(cfg: { url: string; username: string; password: string; indices: Record<string, string> }) {
+  localStorage.setItem(LS_ES_CONFIG, JSON.stringify(cfg))
+}
+
+function SourcePill({ source, setSource, es, onOfflineReady }: {
   source: DataSource; setSource: (s: DataSource) => void; es: EsState
+  onOfflineReady: (from: Date, to: Date) => void
 }) {
   const [open, setOpen] = useState(false)
-  const col = source === 'demo'
-    ? C.dim
+  const [editConfig, setEditConfig] = useState(false)
+  const stored = loadEsConfig()
+  const [url, setUrl] = useState(stored?.url ?? '/es')
+  const [username, setUsername] = useState(stored?.username ?? 'elastic')
+  const [password, setPassword] = useState(stored?.password ?? '')
+  const [indices, setIndices] = useState<Record<string, string>>(
+    stored?.indices ?? Object.fromEntries(ES_TENANTS.map(t => [t.id, t.index]))
+  )
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [])
+
+  function applyConfig() {
+    const cfg = { url, username, password, indices }
+    saveEsConfig(cfg)
+    setEsRuntimeConfig({ url, username, password })
+    for (const [id, idx] of Object.entries(indices)) setEsTenantIndex(id, idx)
+    es.refresh()
+    setEditConfig(false)
+  }
+
+  const savedUpload = loadUploadState()
+  const col = source === 'demo' ? C.dim
+    : source === 'file' ? C.purple
     : es.status === 'live' ? C.green : es.status === 'error' ? C.red : C.amber
-  const label = source === 'demo'
-    ? 'Demo data'
+  const label = source === 'demo' ? 'Demo data'
+    : source === 'file' ? (savedUpload?.phase === 'processing' ? 'Offline · processing…' : savedUpload?.phase === 'ready' ? 'Offline · ready' : 'Offline Analysis')
     : es.status === 'live' ? `Elastic · ${es.latencyMs}ms`
       : es.status === 'error' ? 'Elastic · error' : 'Elastic · connecting'
 
   return (
-    <div className="relative">
+    <div ref={ref} className="relative">
       <button
         onClick={() => setOpen(!open)}
         className="mono text-[10px] px-2 py-1 rounded flex items-center gap-1.5 transition-colors"
         style={{ background: a(col, 0.1), border: `1px solid ${a(col, 0.28)}`, color: col }}
         title={es.error ?? 'Data source'}
       >
-        <span className={`w-1.5 h-1.5 rounded-full ${es.status === 'live' ? 'animate-pulse-dot' : ''}`} style={{ background: col }} />
+        <span className={`w-1.5 h-1.5 rounded-full ${(es.status === 'live' && source === 'elastic') || (source === 'file' && savedUpload?.phase === 'processing') ? 'animate-pulse-dot' : ''}`} style={{ background: col }} />
         <span>{label}</span>
         <span className="text-[var(--c-faint)]">▾</span>
       </button>
 
       {open && (
         <div className="absolute right-0 top-full mt-1 z-50 rounded p-3 flex flex-col gap-2"
-          style={{ background: C.card, border: `1px solid ${C.border}`, minWidth: 320 }}>
+          style={{ background: C.card, border: `1px solid ${C.border}`, minWidth: 340 }}>
           <div className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest">Data source</div>
+
           {([['demo', 'Demo generator', '5 synthetic tenants'],
-            ['elastic', 'Elasticsearch', ES_TENANTS.map(t => t.index).join(' · ')]] as [DataSource, string, string][])
+            ['elastic', 'Elasticsearch', ES_TENANTS.map(t => t.index).join(' · ')],
+            ['file', 'Offline Analysis', 'upload logs → pipeline → ES']] as [DataSource, string, string][])
             .map(([id, name, sub]) => (
               <button
                 key={id}
-                onClick={() => { setSource(id); setOpen(false) }}
+                onClick={() => { setSource(id); if (id !== 'elastic') setEditConfig(false) }}
                 className="text-left px-2 py-1.5 rounded"
                 style={{ background: source === id ? a(C.cyan, 0.1) : 'transparent', border: `1px solid ${source === id ? a(C.cyan, 0.3) : 'transparent'}` }}
               >
@@ -3074,33 +3371,102 @@ function SourcePill({ source, setSource, es }: {
               </button>
             ))}
 
+          {source === 'file' && (
+            <div className="pt-2 mt-1" style={{ borderTop: `1px solid ${C.border}` }}>
+              <OfflineUploadPanel onReady={(from, to) => {
+                onOfflineReady(from, to)
+                setSource('elastic')
+                setOpen(false)
+              }} />
+            </div>
+          )}
+
           {source === 'elastic' && (
-            <div className="pt-2 mt-1 flex flex-col gap-1" style={{ borderTop: `1px solid ${C.border}` }}>
-              {[
-                ['Endpoint', ES_BASE],
-                ['Status', es.status],
-                ['Last poll', es.lastPoll ?? '—'],
-                ['Docs pulled', es.docsSeen.toLocaleString()],
-                ['Window', `${es.logs.length} events buffered`],
-              ].map(([k, v]) => (
-                <div key={k} className="flex justify-between gap-3">
-                  <span className="mono text-[10px] text-[var(--c-faint)]">{k}</span>
-                  <span className="mono text-[10px] text-[var(--c-dim)] truncate">{v}</span>
-                </div>
-              ))}
-              {es.error && (
-                <div className="mono text-[10px] mt-1 p-2 rounded leading-relaxed"
-                  style={{ background: a(C.red, 0.06), border: `1px solid ${a(C.red, 0.2)}`, color: C.red }}>
-                  {es.error}
-                </div>
+            <div className="flex flex-col gap-2 pt-2 mt-1" style={{ borderTop: `1px solid ${C.border}` }}>
+              {!editConfig ? (
+                <>
+                  {([
+                    ['Endpoint', url || ES_BASE],
+                    ['User', username || 'elastic'],
+                    ['Status', es.status],
+                    ['Last poll', es.lastPoll ?? '—'],
+                    ['Docs pulled', es.docsSeen.toLocaleString()],
+                  ] as [string, string][]).map(([k, v]) => (
+                    <div key={k} className="flex justify-between gap-3">
+                      <span className="mono text-[10px] text-[var(--c-faint)]">{k}</span>
+                      <span className="mono text-[10px] text-[var(--c-dim)] truncate max-w-48">{v}</span>
+                    </div>
+                  ))}
+                  {es.error && (
+                    <div className="mono text-[10px] p-2 rounded leading-relaxed"
+                      style={{ background: a(C.red, 0.06), border: `1px solid ${a(C.red, 0.2)}`, color: C.red }}>
+                      {es.error}
+                    </div>
+                  )}
+                  <div className="flex gap-2 mt-1">
+                    <button onClick={() => es.refresh()}
+                      className="mono text-[10px] px-2 py-1 rounded"
+                      style={{ background: a(C.cyan, 0.1), border: `1px solid ${a(C.cyan, 0.3)}`, color: C.cyan }}>
+                      ⟳ Reconnect
+                    </button>
+                    <button onClick={() => setEditConfig(true)}
+                      className="mono text-[10px] px-2 py-1 rounded"
+                      style={{ background: a(C.amber, 0.1), border: `1px solid ${a(C.amber, 0.3)}`, color: C.amber }}>
+                      ⚙ Configure
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="mono text-[9px] uppercase tracking-widest" style={{ color: C.faint }}>Connection</div>
+                  <label className="flex flex-col gap-1">
+                    <span className="mono text-[10px]" style={{ color: C.dim }}>Endpoint URL</span>
+                    <input value={url} onChange={e => setUrl(e.target.value)}
+                      placeholder="https://localhost:19200"
+                      className="mono text-[11px] px-2 py-1.5 rounded outline-none"
+                      style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="flex flex-col gap-1">
+                      <span className="mono text-[10px]" style={{ color: C.dim }}>Username</span>
+                      <input value={username} onChange={e => setUsername(e.target.value)}
+                        placeholder="elastic"
+                        className="mono text-[11px] px-2 py-1.5 rounded outline-none"
+                        style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
+                    </label>
+                    <label className="flex flex-col gap-1">
+                      <span className="mono text-[10px]" style={{ color: C.dim }}>Password</span>
+                      <input value={password} onChange={e => setPassword(e.target.value)}
+                        type="password" placeholder="••••••••"
+                        className="mono text-[11px] px-2 py-1.5 rounded outline-none"
+                        style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
+                    </label>
+                  </div>
+                  <div className="mono text-[9px] uppercase tracking-widest mt-1" style={{ color: C.faint }}>Index patterns (data streams)</div>
+                  {ES_TENANTS.map(t => (
+                    <label key={t.id} className="flex items-center gap-2">
+                      <span className="mono text-[10px] w-10 flex-shrink-0" style={{ color: C.dim }}>{t.short}</span>
+                      <input value={indices[t.id] ?? t.index}
+                        onChange={e => setIndices(p => ({ ...p, [t.id]: e.target.value }))}
+                        placeholder={t.index}
+                        className="mono text-[11px] px-2 py-1 rounded outline-none flex-1"
+                        style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
+                    </label>
+                  ))}
+                  <div className="flex gap-2 mt-1">
+                    <button onClick={applyConfig}
+                      className="mono text-[11px] px-3 py-1.5 rounded"
+                      style={{ background: a(C.cyan, 0.14), border: `1px solid ${a(C.cyan, 0.3)}`, color: C.cyan }}>
+                      Connect
+                    </button>
+                    <button onClick={() => setEditConfig(false)}
+                      className="mono text-[10px] px-2 py-1 rounded"
+                      style={{ border: `1px solid ${C.border}`, color: C.faint }}>
+                      Cancel
+                    </button>
+                  </div>
+                </>
               )}
-              <button
-                onClick={() => { es.refresh(); setOpen(false) }}
-                className="mono text-[10px] mt-1 px-2 py-1 rounded self-start"
-                style={{ background: a(C.cyan, 0.1), border: `1px solid ${a(C.cyan, 0.3)}`, color: C.cyan }}
-              >
-                ⟳ Reconnect
-              </button>
             </div>
           )}
         </div>
@@ -3437,21 +3803,33 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
   logs: LogEntry[]
   domain: DomainFilter
   setDomain: (d: DomainFilter) => void
-  esServices?: Record<string, { service: string }[]>
+  esServices?: Record<string, ServiceRollup[]>
   timeWindow?: TimeWindow
   setTimeWindow?: (w: TimeWindow) => void
 }) {
   const d = DOMAIN_BY_ID[domain]
   const profile = TEAM_PROFILES[domain]
-  const liveRollup = esServices?.[domain]
+  // Only use live rollup when ES actually returned services; [] falls back to demo.
+  const liveRollup = esServices?.[domain]?.length ? esServices[domain] : undefined
   const domainLogs = logs.filter(l => l.domain === domain)
   const errLogs = domainLogs.filter(l => l.severity === 'CRITICAL' || l.severity === 'ERROR')
   const errorRate = domainLogs.length ? ((errLogs.length / domainLogs.length) * 100).toFixed(1) : '0.0'
-  const logRate = Math.floor(d.share * 4200)
 
-  // Active = services with errRate < 5, inactive = others
+  // Use real ES rollup when available; fall back to seeded demo stats.
   const svcList = liveRollup ? liveRollup.map(s => s.service) : d.services
-  const svcStats = svcList.map(s => serviceStats(s))
+  const svcStats = liveRollup
+    ? liveRollup.map(r => ({
+        status: (r.errRate > 5 ? 'degraded' : r.errRate > 2 ? 'watch' : 'healthy') as 'healthy' | 'watch' | 'degraded',
+        errRate: r.errRate,
+        p99: r.p99,
+        logsPerMin: Math.round(r.events / 60),
+        runtime: 'live',
+        version: 'v—',
+      }))
+    : svcList.map(s => serviceStats(s))
+  const logRate = liveRollup
+    ? liveRollup.reduce((n, s) => n + s.events, 0)
+    : Math.floor(d.share * 4200)
   const active = svcStats.filter(s => s.status !== 'degraded')
   const inactive = svcStats.filter(s => s.status === 'degraded')
 
@@ -3556,14 +3934,52 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
 
 // ─── SLASection ───────────────────────────────────────────────────────────────
 
-function SLASection({ domain, timeWindow, setTimeWindow }: {
-  domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void
+function SLASection({ domain, dateRange, timeWindow, esServices, esVolume }: {
+  domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow
+  esServices?: Record<string, ServiceRollup[]>
+  esVolume?: Record<string, VolumeBucket[]>
 }) {
   const slaRows = DOMAINS.map(d => {
+    const rollup = esServices?.[d.id]?.length ? esServices[d.id] : undefined
+    const realErrRate = rollup
+      ? rollup.reduce((s, r) => s + r.errRate * r.events, 0) / Math.max(1, rollup.reduce((s, r) => s + r.events, 0))
+      : null
+    const attainment = realErrRate !== null ? Number((100 - realErrRate).toFixed(2)) : d.slo.attainment
+    const targetPct = Number(d.slo.target.replace('%', ''))
+    const sustainableErrRate = 100 - targetPct
+    const burn = realErrRate !== null
+      ? Number((realErrRate / Math.max(0.001, sustainableErrRate)).toFixed(1))
+      : d.slo.burn
     const breachCount = Math.floor(seeded(d.id + 'breach', 0) * 8)
-    const trend = d.slo.burn > 4 ? '↑' : d.slo.burn > 1.5 ? '→' : '↓'
-    return { d, breachCount, trend }
+    const trend = burn > 4 ? '↑' : burn > 1.5 ? '→' : '↓'
+    return { d, attainment, burn, breachCount, trend }
   })
+
+  // Burn trend: derive from real volume error rates when available.
+  const burnTrend = useMemo(() => {
+    if (esVolume) {
+      const tenants = DOMAINS.filter(d => esVolume[d.id]?.length)
+      if (tenants.length > 0) {
+        const maxLen = Math.max(...tenants.map(d => esVolume[d.id].length))
+        return Array.from({ length: maxLen }, (_, i) => {
+          const row: Record<string, number | string> = { time: '' }
+          for (const d of DOMAINS) {
+            const buckets = esVolume[d.id]
+            if (!buckets?.length) continue
+            const b = buckets[Math.min(i, buckets.length - 1)]
+            row.time = b.time
+            const errRate = b.total > 0 ? b.errors / b.total : 0
+            const target = Number(d.slo.target.replace('%', '')) / 100
+            row[d.id] = Number(Math.min(8, errRate / Math.max(0.0001, 1 - target)).toFixed(2))
+          }
+          return row
+        })
+      }
+    }
+    const to = dateRange ? dateRange.to.getTime() : Date.now()
+    const from = dateRange ? dateRange.from.getTime() : to - 86_400_000
+    return makeBurnTrend(from, to)
+  }, [dateRange, esVolume])
 
   const BREACH_HISTORY = [
     { when: '16:03–16:18 UTC', lob: 'mps', desc: 'Auth success rate below 99.9% for 15m — conn pool exhausted', severity: 'critical', mttr: '18m' },
@@ -3577,16 +3993,16 @@ function SLASection({ domain, timeWindow, setTimeWindow }: {
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
       {/* SLA matrix */}
       <div className="card p-4">
-        <SectionHeader title="SLA Attainment" sub={`all LoBs · ${timeWindow ?? '24h'}`} />
+        <SectionHeader title="SLA Attainment" sub={`all LoBs · ${dateRange?.label ?? timeWindow ?? '24h'}`} />
         <div className="mono text-[10px] text-[var(--c-faint)] grid gap-2 px-1 pb-2 uppercase tracking-widest"
           style={{ gridTemplateColumns: '140px 1fr 80px 80px 80px 60px' }}>
           <span>LoB</span><span>SLO</span><span className="text-right">Target</span>
           <span className="text-right">Attainment</span><span className="text-right">Burn</span><span className="text-right">Breaches</span>
         </div>
         <div className="flex flex-col gap-px">
-          {slaRows.map(({ d, breachCount, trend }) => {
-            const ok = d.slo.attainment >= Number(d.slo.target.replace('%', ''))
-            const col = d.slo.burn > 6 ? C.red : d.slo.burn > 2 ? C.amber : C.green
+          {slaRows.map(({ d, attainment, burn, breachCount, trend }) => {
+            const ok = attainment >= Number(d.slo.target.replace('%', ''))
+            const col = burn > 6 ? C.red : burn > 2 ? C.amber : C.green
             return (
               <div key={d.id} className="log-row grid gap-2 items-center px-1 py-2 rounded"
                 style={{ gridTemplateColumns: '140px 1fr 80px 80px 80px 60px', background: d.id === domain ? a(domainColor(d.id), 0.06) : 'transparent' }}>
@@ -3596,9 +4012,9 @@ function SLASection({ domain, timeWindow, setTimeWindow }: {
                 </div>
                 <span className="mono text-[10px] text-[var(--c-dim)] truncate">{d.slo.name}</span>
                 <span className="mono text-[11px] text-right text-[var(--c-dim)]">{d.slo.target}</span>
-                <span className="mono text-[11px] text-right" style={{ color: ok ? C.green : C.red }}>{d.slo.attainment}%</span>
+                <span className="mono text-[11px] text-right" style={{ color: ok ? C.green : C.red }}>{attainment}%</span>
                 <span className="mono text-[11px] text-right flex items-center justify-end gap-1" style={{ color: col }}>
-                  {d.slo.burn.toFixed(1)}× <span className="text-[10px]">{trend}</span>
+                  {burn.toFixed(1)}× <span className="text-[10px]">{trend}</span>
                 </span>
                 <span className="mono text-[11px] text-right" style={{ color: breachCount > 3 ? C.red : breachCount > 0 ? C.amber : C.dim }}>
                   {breachCount}
@@ -3611,9 +4027,9 @@ function SLASection({ domain, timeWindow, setTimeWindow }: {
 
       {/* Burn trend sparklines */}
       <div className="card p-4">
-        <SectionHeader title="Burn Rate Trend" sub="24h · 1× = sustainable · >6× pages" />
+        <SectionHeader title="Burn Rate Trend" sub={`${dateRange?.label ?? '24h'} · 1× = sustainable · >6× pages`} />
         <ResponsiveContainer width="100%" height={180}>
-          <LineChart data={BURN_TREND} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
+          <LineChart data={burnTrend} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
             <XAxis dataKey="time" tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} interval={3} />
             <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={36} domain={[0, 8]} tickFormatter={(v: number) => `${v}×`} />
@@ -3628,7 +4044,7 @@ function SLASection({ domain, timeWindow, setTimeWindow }: {
 
       {/* Breach history */}
       <div className="card p-4">
-        <SectionHeader title="Breach History" sub="last 24h · all LoBs" />
+        <SectionHeader title="Breach History" sub={`${dateRange?.label ?? 'last 24h'} · all LoBs`} />
         <div className="flex flex-col gap-2">
           {BREACH_HISTORY.map((b, i) => {
             const bc = b.severity === 'critical' ? C.red : b.severity === 'high' ? C.orange : C.amber
@@ -4095,7 +4511,27 @@ export default function App() {
     () => (typeof localStorage !== 'undefined' && (localStorage.getItem('logsense-theme') as ThemeMode)) || 'system'
   )
 
-  const es = useElasticStream({ enabled: source === 'elastic', live, pollMs: 5000 })
+  const esSince = dateRange
+    ? new Date(dateRange.from).toISOString()
+    : 'now-24h'
+  const esAggHours = dateRange
+    ? Math.max(1, Math.ceil((dateRange.to.getTime() - dateRange.from.getTime()) / 3_600_000))
+    : 24
+  const es = useElasticStream({ enabled: source === 'elastic', live, pollMs: 5000, since: esSince, aggHours: esAggHours })
+
+  // Apply any saved ES config on first render so the hook connects with the right credentials.
+  useEffect(() => {
+    const saved = loadEsConfig()
+    if (saved) {
+      setEsRuntimeConfig({ url: saved.url, username: saved.username, password: saved.password })
+      for (const [id, idx] of Object.entries(saved.indices)) setEsTenantIndex(id, idx)
+    }
+  }, [])
+
+  // Reset the ES cursor whenever the date range changes so new since/until are applied.
+  useEffect(() => {
+    if (source === 'elastic') es.refresh()
+  }, [esSince, esAggHours])
 
   // Swap the tenant registry with the data source, before children render.
   const esDomains = useMemo(() => elasticDomains(es.services), [es.services])
@@ -4276,7 +4712,13 @@ export default function App() {
             ))}
           </div>
 
-          <SourcePill source={source} setSource={setSource} es={es} />
+          <SourcePill source={source} setSource={setSource} es={es} onOfflineReady={(from, to) => {
+              // Cap the date range to the last 30 days of the indexed data to avoid fetching millions of docs.
+              const capFrom = new Date(Math.max(from.getTime(), to.getTime() - 30 * 86400000))
+              setDateRange({ from: capFrom, to, label: `Offline ${capFrom.toLocaleDateString()} – ${to.toLocaleDateString()}` })
+              setSource('elastic')
+              es.refresh()
+            }} />
 
           <button
             onClick={() => setAskOpen(o => !o)}
@@ -4330,17 +4772,46 @@ export default function App() {
         </div>
 
         {/* Content */}
-        <main className="flex-1 min-h-0 p-4 overflow-hidden">
+        <main className="flex-1 min-h-0 p-4 overflow-hidden flex flex-col gap-0">
+          {/* Offline analysis banner — shown while upload is pending/processing */}
+          {source === 'file' && (() => {
+            const up = loadUploadState()
+            if (!up || up.phase === 'idle') return null
+            const isProcessing = up.phase === 'processing' || up.phase === 'uploading'
+            return (
+              <div className="flex items-center gap-3 px-3 py-2 rounded mb-3 flex-shrink-0 mono text-[11px]"
+                style={{ background: a(C.purple, 0.08), border: `1px solid ${a(C.purple, 0.25)}`, color: C.purple }}>
+                {isProcessing && <span className="w-1.5 h-1.5 rounded-full animate-pulse-dot flex-shrink-0" style={{ background: C.amber }} />}
+                {up.phase === 'ready' && <span>✓</span>}
+                <span className="flex-1">{up.progress || 'Offline analysis in progress…'}</span>
+                {up.phase === 'ready' && (
+                  <button onClick={() => {
+                    if (up.fromTs && up.toTs) {
+                      const to = new Date(up.toTs)
+                      const from = new Date(Math.max(new Date(up.fromTs).getTime(), to.getTime() - 30 * 86400000))
+                      setDateRange({ from, to, label: `Offline ${from.toLocaleDateString()} \u2013 ${to.toLocaleDateString()}` })
+                    }
+                    setSource('elastic'); es.refresh()
+                  }}
+                    className="px-2 py-0.5 rounded" style={{ background: a(C.cyan, 0.15), color: C.cyan, border: `1px solid ${a(C.cyan, 0.3)}` }}>
+                    View results \u2192
+                  </button>
+                )}
+              </div>
+            )
+          })()}
+          <div className="flex-1 min-h-0 overflow-hidden">
           {section === 'lob' && (
             <LobSection logs={activeLogs} domain={domain} setDomain={setDomain} esServices={source === 'elastic' ? es.services : undefined} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
           )}
           {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={domain} />}
-          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
-          {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
-          {section === 'sla' && <SLASection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
+          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esErrorTypes={source === 'elastic' ? es.errorTypes[domain] : undefined} esVolume={source === 'elastic' ? es.volume[domain] : undefined} />}
+          {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esVolume={source === 'elastic' ? es.volume[domain] : undefined} />}
+          {section === 'sla' && <SLASection domain={domain} dateRange={dateRange} timeWindow={timeWindow} esServices={source === 'elastic' ? es.services : undefined} esVolume={source === 'elastic' ? es.volume : undefined} />}
           {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={domain} setDomain={setDomain} />}
           {section === 'agent' && <CustomAgentSection domain={domain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
-          {section === 'pipeline' && <PipelineSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />}
+          {section === 'pipeline' && <PipelineSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esServices={source === 'elastic' ? es.services : undefined} />}
+          </div>
         </main>
       </div>
 

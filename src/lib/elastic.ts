@@ -27,13 +27,13 @@ const ES_API_KEY = (env.VITE_ES_API_KEY as string | undefined) || ''
 export const ES_TENANTS: { id: DomainId; index: string; label: string; team: string; short: string; icon: string }[] = [
   {
     id: 'mps',
-    index: (env.VITE_ES_INDEX_MPS as string | undefined) || 'logs-mps-*',
-    label: 'MPS', team: 'MPS Platform', short: 'MPS', icon: '⛃',
+    index: (env.VITE_ES_INDEX_MPS as string | undefined) || 'logs-mps_parsed-offline',
+    label: 'MPS', team: 'MPS Kiosk Logs', short: 'MPS', icon: '⛃',
   },
   {
     id: 'mrd',
-    index: (env.VITE_ES_INDEX_MRD as string | undefined) || 'logs-mrd-*',
-    label: 'MRD', team: 'MRD Platform', short: 'MRD', icon: '⛂',
+    index: (env.VITE_ES_INDEX_MRD as string | undefined) || 'logs-mrd_parsed-offline',
+    label: 'MRD', team: 'MRD Traffic Management Logs', short: 'MRD', icon: '⛂',
   },
 ]
 
@@ -64,11 +64,40 @@ export class EsError extends Error {
   }
 }
 
-async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (ES_API_KEY) headers.Authorization = `ApiKey ${ES_API_KEY}`
+// Runtime-mutable config — overrides build-time env vars when set via the UI.
+export let esRuntimeConfig = {
+  url: ES_BASE,
+  /** ApiKey header value, or empty string. */
+  apiKey: (env.VITE_ES_API_KEY as string | undefined) || '',
+  /** Basic auth — used when apiKey is empty. */
+  username: (env.VITE_ES_USERNAME as string | undefined) || '',
+  password: (env.VITE_ES_PASSWORD as string | undefined) || '',
+}
 
-  const res = await fetch(`${ES_BASE}${path}`, {
+export function setEsRuntimeConfig(cfg: { url: string; apiKey?: string; username?: string; password?: string }) {
+  esRuntimeConfig = {
+    url: cfg.url.replace(/\/$/, '') || '/es',
+    apiKey: cfg.apiKey ?? esRuntimeConfig.apiKey,
+    username: cfg.username ?? esRuntimeConfig.username,
+    password: cfg.password ?? esRuntimeConfig.password,
+  }
+}
+
+export function setEsTenantIndex(id: string, index: string) {
+  const t = ES_TENANTS.find(t => t.id === id)
+  if (t) t.index = index
+}
+
+async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
+  const { url, apiKey, username, password } = esRuntimeConfig
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (apiKey) {
+    headers.Authorization = `ApiKey ${apiKey}`
+  } else if (username) {
+    headers.Authorization = `Basic ${btoa(`${username}:${password}`)}`
+  }
+
+  const res = await fetch(`${url}${path}`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -169,20 +198,52 @@ function buildQuery(q: StreamQuery) {
   return { bool: { filter, ...(must.length ? { must } : {}) } }
 }
 
-/** Newest-first page of logs for one tenant. */
+/** Newest-first page of logs for one tenant (single request, for live tailing). */
 export async function searchLogs(
   tenant: { id: DomainId; index: string },
   q: StreamQuery = {},
   signal?: AbortSignal,
 ): Promise<LogEntry[]> {
   const body = {
-    size: q.size ?? 200,
-    sort: [{ [FIELDS.timestamp]: 'desc' }],
+    size: q.size ?? 1000,
+    sort: [{ [FIELDS.timestamp]: 'desc' }, { '_doc': 'asc' }],
     track_total_hits: false,
     query: buildQuery(q),
   }
   const json = await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, body, signal)
   return (json.hits?.hits ?? []).map((h: any) => mapDoc(h, tenant.id))
+}
+
+/** Fetches documents using search_after pagination, stopping at maxDocs to prevent unbounded requests. */
+export async function searchAllLogs(
+  tenant: { id: DomainId; index: string },
+  q: StreamQuery = {},
+  onPage: (page: LogEntry[]) => void,
+  signal?: AbortSignal,
+  maxDocs = 50000,
+): Promise<void> {
+  const PAGE = 1000
+  let searchAfter: any[] | undefined
+  let fetched = 0
+
+  while (fetched < maxDocs) {
+    const body: any = {
+      size: Math.min(PAGE, maxDocs - fetched),
+      sort: [{ [FIELDS.timestamp]: 'desc' }, { '_doc': 'asc' }],
+      track_total_hits: false,
+      query: buildQuery(q),
+    }
+    if (searchAfter) body.search_after = searchAfter
+
+    const json = await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, body, signal)
+    const hits: any[] = json.hits?.hits ?? []
+    if (!hits.length) break
+
+    onPage(hits.map((h: any) => mapDoc(h, tenant.id)))
+    fetched += hits.length
+    if (hits.length < PAGE) break
+    searchAfter = hits[hits.length - 1].sort
+  }
 }
 
 export interface VolumeBucket { time: string; total: number; errors: number; warns: number }
@@ -277,19 +338,33 @@ export async function fetchErrorTypes(
   hours = 24,
   signal?: AbortSignal,
 ): Promise<ErrorTypeBucket[]> {
-  const body = {
-    size: 0,
-    query: {
-      bool: {
-        filter: [{ range: { [FIELDS.timestamp]: { gte: `now-${hours}h` } } }],
-        should: ['error', 'critical', 'fatal', 'ERROR', 'CRITICAL'].map(v => ({ term: { [FIELDS.severity]: v } })),
-        minimum_should_match: 1,
-      },
+  const errorFilter = {
+    bool: {
+      filter: [{ range: { [FIELDS.timestamp]: { gte: `now-${hours}h` } } }],
+      should: ['error', 'critical', 'fatal', 'ERROR', 'CRITICAL'].map(v => ({ term: { [FIELDS.severity]: v } })),
+      minimum_should_match: 1,
     },
-    aggs: { by_type: { terms: { field: `${FIELDS.errorType}.keyword`, size: 7, missing: 'Uncategorised' } } },
   }
-  const json = await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, body, signal)
-  const buckets = json.aggregations?.by_type?.buckets ?? []
+
+  // Try error.type first; fall back to service.name when error.type is unpopulated.
+  const byType = await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, {
+    size: 0,
+    query: errorFilter,
+    aggs: { by_type: { terms: { field: `${FIELDS.errorType}.keyword`, size: 7, missing: 'Uncategorised' } } },
+  }, signal)
+
+  const typeBuckets: any[] = byType.aggregations?.by_type?.buckets ?? []
+  const allUncategorised = typeBuckets.length === 0 ||
+    (typeBuckets.length === 1 && typeBuckets[0].key === 'Uncategorised')
+
+  const buckets: any[] = allUncategorised
+    ? ((await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, {
+        size: 0,
+        query: errorFilter,
+        aggs: { by_type: { terms: { field: `${FIELDS.service}.keyword`, size: 7 } } },
+      }, signal)).aggregations?.by_type?.buckets ?? [])
+    : typeBuckets
+
   const total = buckets.reduce((n: number, b: any) => n + b.doc_count, 0) || 1
   return buckets.map((b: any) => ({
     name: String(b.key),

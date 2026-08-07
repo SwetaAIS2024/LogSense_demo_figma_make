@@ -1,4 +1,4 @@
-import { defineConfig, type HtmlTagDescriptor, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type HtmlTagDescriptor, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
@@ -7,11 +7,15 @@ import siteConfiguration from './.figma/make/site.json'
 
 // Vite config — https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
+  // Merge .env into process.env so non-VITE_ vars (ES_URL, ES_USERNAME…) reach the proxy config.
+  const fileEnv = loadEnv(mode, process.cwd(), '')
+  const env = { ...process.env, ...fileEnv }
+
   // .figma/make/deploy-preview passes `--mode development` for cached-preview builds.
   const emitSourcemaps = mode === 'development'
 
   return {
-    base: process.env.FIGMA_PUBLIC_URL ? `${process.env.FIGMA_PUBLIC_URL}/` : '/',
+    base: env.FIGMA_PUBLIC_URL ? `${env.FIGMA_PUBLIC_URL}/` : '/',
     build: {
       sourcemap: emitSourcemaps ? 'inline' : false,
       minify: !emitSourcemaps,
@@ -31,35 +35,38 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       host: '0.0.0.0',
-      port: parseInt(process.env.PORT || '8443'),
+      port: parseInt(env.PORT || '8443'),
       strictPort: true,
       watch: { ignored: ['**/.figma/**'] },
-      // `/es` → the cluster, with the API key injected here rather than in the
-      // browser bundle. Set ES_URL and ES_API_KEY in the server environment.
-      proxy: process.env.ES_URL
-        ? {
+      // All proxy routes in one object so Vite sees them together.
+      proxy: {
+        ...(env.ES_URL ? {
           '/es': {
-            target: process.env.ES_URL,
+            target: env.ES_URL,
             changeOrigin: true,
-            secure: process.env.ES_INSECURE !== 'true',
+            secure: env.ES_INSECURE !== 'true',
             rewrite: (p: string) => p.replace(/^\/es/, ''),
             configure: (proxy: any) => {
               proxy.on('proxyReq', (proxyReq: any) => {
-                if (process.env.ES_API_KEY) {
-                  proxyReq.setHeader('Authorization', `ApiKey ${process.env.ES_API_KEY}`)
-                } else if (process.env.ES_USERNAME) {
-                  const basic = Buffer.from(`${process.env.ES_USERNAME}:${process.env.ES_PASSWORD ?? ''}`).toString('base64')
+                if (env.ES_API_KEY) {
+                  proxyReq.setHeader('Authorization', `ApiKey ${env.ES_API_KEY}`)
+                } else if (env.ES_USERNAME) {
+                  const basic = Buffer.from(`${env.ES_USERNAME}:${env.ES_PASSWORD ?? ''}`).toString('base64')
                   proxyReq.setHeader('Authorization', `Basic ${basic}`)
                 }
               })
             },
           },
-        }
-        : undefined,
+        } : {}),
+        ...(env.UPLOAD_URL ? {
+          '/upload': { target: env.UPLOAD_URL, changeOrigin: true },
+          '/status': { target: env.UPLOAD_URL, changeOrigin: true },
+        } : {}),
+      },
     },
     preview: {
       host: '0.0.0.0',
-      port: parseInt(process.env.PORT || '8443'),
+      port: parseInt(env.PORT || '8443'),
     },
   }
 })
