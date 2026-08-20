@@ -78,9 +78,19 @@ function usePrefersDark() {
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type DataSource = 'demo' | 'elastic' | 'file'
-type NavSection = 'lob' | 'logs' | 'errors' | 'anomalies' | 'sla' | 'rca' | 'agent' | 'pipeline'
+type NavSection = 'lob' | 'logs' | 'errors' | 'anomalies' | 'sla' | 'rca' | 'agent' | 'pipeline' | 'aimonitor'
 type TimeWindow = '1m' | '5m' | '15m' | '1h' | '6h' | '24h' | '7d'
 type DateRange = { from: Date; to: Date; label: string }
+
+/** Unified view of whichever data source is active. null = source is live but data not yet arrived → show empty. */
+interface ActiveData {
+  source: DataSource
+  errorDist:   ErrorTypeBucket[] | null
+  volume:      VolumeBucket[] | null
+  services:    ServiceRollup[] | null
+  allVolume:   Record<string, VolumeBucket[]> | null
+  allServices: Record<string, ServiceRollup[]> | null
+}
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
@@ -466,11 +476,13 @@ const LLM_MODELS = [
   { id: 'gemini-2-5-pro', name: 'Gemini 2.5 Pro', provider: 'Google', icon: '◆' },
   { id: 'llama-3-3', name: 'Llama 3.3 70B', provider: 'Meta', icon: '◐' },
   { id: 'mistral-large', name: 'Mistral Large 2', provider: 'Mistral', icon: '◑' },
-  // Open-weight token-optimised reasoning models
+  // Open-weight — runnable locally via Ollama
+  { id: 'qwen2.5:32b', name: 'Qwen 2.5 32B', provider: 'Alibaba / Ollama', icon: '⬡' },
+  { id: 'glm4:9b', name: 'GLM-4 9B', provider: 'Zhipu / Ollama', icon: '▣' },
+  { id: 'glm-4.7-flash', name: 'GLM-4.7-Flash 30B', provider: 'Zhipu / Ollama', icon: '▣' },
   { id: 'qwen3-235b', name: 'Qwen3 235B-A22B', provider: 'Alibaba', icon: '⬡' },
   { id: 'qwen3-32b', name: 'Qwen3 32B', provider: 'Alibaba', icon: '⬡' },
   { id: 'kimi-k2', name: 'Kimi K2', provider: 'Moonshot', icon: '◭' },
-  { id: 'glm-4-32b', name: 'GLM-4 32B', provider: 'Zhipu', icon: '▣' },
   { id: 'glm-z1-32b', name: 'GLM-Z1 32B', provider: 'Zhipu', icon: '▣' },
 ]
 
@@ -650,6 +662,36 @@ function serviceStats(svc: string, live?: ServiceRollup) {
     status: errRate > 5 ? 'degraded' : errRate > 2.5 ? 'watch' : 'healthy',
     live: Boolean(live),
   }
+}
+
+// ─── useActiveData ─────────────────────────────────────────────────────────────
+// Single hook called once in App. All sections receive ActiveData — no per-section
+// ES props or isElastic flags. Adding a new source = one switch case here only.
+
+function useActiveData(source: DataSource, domain: DomainFilter, es: EsState): ActiveData {
+  return useMemo(() => {
+    switch (source) {
+      case 'demo':
+        return {
+          source,
+          errorDist:   ERROR_DIST_BY_DOMAIN[domain],
+          volume:      null, // sections generate synthetic volume for demo via seeded()
+          services:    null, // LobSection uses serviceStats() from d.services in demo mode
+          allVolume:   null,
+          allServices: null,
+        }
+      default: // 'elastic' | 'file' — real data or null while waiting
+        return {
+          source,
+          errorDist:   es.errorTypes[domain]?.length ? es.errorTypes[domain] : null,
+          volume:      es.volume[domain]?.length ? es.volume[domain] : null,
+          services:    es.services[domain]?.length ? es.services[domain] : null,
+          allVolume:   Object.keys(es.volume).length ? es.volume : null,
+          allServices: Object.keys(es.services).length ? es.services : null,
+        }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source, domain, es.errorTypes, es.volume, es.services])
 }
 
 // ─── Colour helpers ────────────────────────────────────────────────────────────
@@ -1346,9 +1388,9 @@ const FINGERPRINTS: { fp: string; dom: DomainId; svc: string; count: number; fir
   { fp: 'ERR-cert-expired-mtls', dom: 'ssa', svc: 'camera-analytics', count: 198, first: '2h ago', last: '6m ago', trend: '↑', also: ['mps'] },
 ]
 
-function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow, esErrorTypes, esVolume }: { logs: LogEntry[]; domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esErrorTypes?: ErrorTypeBucket[]; esVolume?: VolumeBucket[] }) {
+function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow, data }: { logs: LogEntry[]; domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; data: ActiveData }) {
   const PIE_COLORS = [C.red, C.orange, C.amber, C.cyan, C.purple, C.green, C.dim]
-  const dist = esErrorTypes?.length ? esErrorTypes : ERROR_DIST_BY_DOMAIN[domain]
+  const dist = data.errorDist ?? []
   const [selectedCell, setSelectedCell] = useState<{ day: number; hr: number } | null>(null)
 
   // Heatmap: derive from real log timestamps when available, else use seeded demo values.
@@ -1368,20 +1410,26 @@ function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow, esE
         }))
       )
     }
+    if (data.source !== 'demo') {
+      return Array.from({ length: 7 }, (_, day) =>
+        Array.from({ length: 24 }, (_, hr) => ({ day, hr, val: 0 }))
+      )
+    }
     return Array.from({ length: 7 }, (_, day) =>
       Array.from({ length: 24 }, (_, hr) => ({
         day, hr,
         val: Math.floor(seeded(`hm-${day}`, hr) * 120 + (day === 2 && (hr >= 15 && hr <= 17) ? 300 : 0)),
       }))
     )
-  }, [logs])
+  }, [logs, data.source])
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
   // Trend: use real ES volume buckets when available, else synthetic seeded data.
   const trendData = useMemo(() => {
-    if (esVolume?.length) {
-      return esVolume.map(b => ({ time: b.time, errors: b.errors, warns: b.warns }))
+    if (data.volume?.length) {
+      return data.volume.map(b => ({ time: b.time, errors: b.errors, warns: b.warns }))
     }
+    if (data.source !== 'demo') return []
     const p2 = (n: number) => String(n).padStart(2, '0')
     const toTime = dateRange ? dateRange.to.getTime() : Date.now()
     const fromTime = dateRange ? dateRange.from.getTime() : toTime - TIME_WINDOW_MS[timeWindow ?? '1h']
@@ -1406,14 +1454,14 @@ function ErrorsSection({ logs, domain, dateRange, timeWindow, setTimeWindow, esE
         warns:  Math.floor((base + seeded(`tw-warn-${key}`, i) * 80) * (0.14 + seeded(`tw-wm-${key}`, i) * 0.06)),
       }
     })
-  }, [dateRange, timeWindow, esVolume])
+  }, [dateRange, timeWindow, data.volume, data.source])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Pie */}
         <div className="card p-4">
-          <SectionHeader title="Error Distribution" sub={esErrorTypes?.length && esErrorTypes[0]?.name !== 'Uncategorised' ? 'by error type' : 'by service'} />
+          <SectionHeader title="Error Distribution" sub={data.errorDist?.length && data.errorDist[0]?.name !== 'Uncategorised' ? 'by error type' : 'by service'} />
           <div className="flex gap-4 items-center">
             <ResponsiveContainer width={180} height={180}>
               <PieChart>
@@ -1560,15 +1608,15 @@ const ANOMALIES: { time: string; dom: DomainId; type: string; service: string; s
   { time: 'Yesterday 22:10', dom: 'mps', type: 'Error Burst', service: 'fraud-scoring', score: 0.79, detail: '142 auth failures in 90s — suspected credential stuffing', status: 'Closed', baseline: 'seasonal, 28d' },
 ]
 
-function AnomalySection({ domain, timeWindow, setTimeWindow, esVolume }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esVolume?: VolumeBucket[] }) {
+function AnomalySection({ domain, timeWindow, setTimeWindow, data }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; data: ActiveData }) {
   const [threshold] = useState(300)
   const rows = ANOMALIES.filter(r => r.dom === domain)
 
   // Use real error volume as the anomaly timeline baseline when available.
   const chartData = useMemo(() => {
-    if (esVolume?.length) {
-      const max = Math.max(1, ...esVolume.map(b => b.errors))
-      return esVolume.map((b, i) => ({
+    if (data.volume?.length) {
+      const max = Math.max(1, ...data.volume.map(b => b.errors))
+      return data.volume.map((b, i) => ({
         t: i,
         value: b.errors,
         upper: Math.round(max * 1.3),
@@ -1576,8 +1624,8 @@ function AnomalySection({ domain, timeWindow, setTimeWindow, esVolume }: { domai
         anomaly: b.errors > max * 0.7,
       }))
     }
-    return ANOMALY_DATA
-  }, [esVolume])
+    return data.source === 'demo' ? ANOMALY_DATA : []
+  }, [data.volume, data.source])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -1588,7 +1636,7 @@ function AnomalySection({ domain, timeWindow, setTimeWindow, esVolume }: { domai
       </div>
 
       <div className="card p-4">
-        <SectionHeader title="Anomaly Timeline" sub={esVolume?.length ? 'real error volume · ML-detected spikes' : 'request rate with ML-detected anomalies'} />
+        <SectionHeader title="Anomaly Timeline" sub={data.volume?.length ? 'real error volume · ML-detected spikes' : 'request rate with ML-detected anomalies'} />
         <ResponsiveContainer width="100%" height={220}>
           <AreaChart data={chartData} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
             <defs>
@@ -1932,9 +1980,28 @@ interface ChatMsg {
   tools?: ChatToolCall[]
   table?: ChatTable
   observations?: string[]
+  // demo-fallback metrics
   tokens?: number
   cost?: number
+  // real-agent metrics (from Ollama usage SSE)
+  inputTokens?: number
+  outputTokens?: number
+  latencyMs?: number
+  tokPerSec?: number
   streaming?: boolean
+}
+
+interface AgentMetric {
+  id: string
+  timestamp: string
+  sessionId: string
+  domain: string
+  model: string
+  inputTokens: number
+  outputTokens: number
+  latencyMs: number
+  tokPerSec: number
+  questionSnippet: string
 }
 
 const SUGGESTED_PROMPTS = [
@@ -2037,7 +2104,8 @@ function answerQuestion(q: string, logs: LogEntry[], domain: DomainFilter): Omit
   }
 
   // ── Why is X degraded ─────────────────────────────────────────────────────
-  if (/(why|root cause|rca|degraded|cause of|explain)/.test(t)) {
+  // 'explain' excluded — too broad; matches service-specific data questions like "explain TVM errors"
+  if (/(why|root cause|rca|degraded|cause of)/.test(t)) {
     return {
       text: 'The active P1 (INC-2847) starts in MPS and propagates outward. payment-svc v2.14.1 leaks connections; the auth pool exhausts at 16:02; PIS journey-api calls the MPS token endpoint synchronously, so passenger display screens go blank; MRD signal plan staleness and SSA alert delays follow downstream.',
       tools: [
@@ -2200,54 +2268,128 @@ function ChatResultTable({ table }: { table: ChatTable }) {
   )
 }
 
-function AskPanel({ open, onClose, logs, domain, model, wide, setWide }: {
+function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide, source, dateRange, onMetric }: {
   open: boolean
   onClose: () => void
   logs: LogEntry[]
   domain: DomainFilter
   model: string
+  setModel: (m: string) => void
   wide: boolean
   setWide: (w: boolean) => void
+  source?: DataSource
+  dateRange?: DateRange
+  onMetric?: (m: AgentMetric) => void
 }) {
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [agentModels, setAgentModels] = useState<{ id: string; name: string }[]>([])
   const scrollRef = useRef<HTMLDivElement>(null)
-  const currentModel = LLM_MODELS.find(m => m.id === model) || LLM_MODELS[0]
+  const sessionId = useRef(Math.random().toString(36).slice(2, 10)).current
+  // Prefer live Ollama model if available, else fall back to static demo list.
+  const modelList = agentModels.length > 0 ? agentModels : LLM_MODELS
+  const currentModel = modelList.find(m => m.id === model) || modelList[0]
 
-  // Keep the newest turn in view while tokens arrive.
+  useEffect(() => {
+    fetch('/agent/models')
+      .then(r => r.json())
+      .then(j => { if (j.ok && j.models.length) setAgentModels(j.models) })
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages])
 
-  const send = useCallback((raw: string) => {
+  const send = useCallback(async (raw: string) => {
     const q = raw.trim()
     if (!q || busy) return
     setInput('')
     setBusy(true)
-
-    const answer = answerQuestion(q, logs, domain)
     const agentId = Math.random().toString(36).slice(2, 10)
     setMessages(prev => [
       ...prev,
       { id: Math.random().toString(36).slice(2, 10), role: 'user', text: q },
-      { id: agentId, role: 'agent', text: '', tools: answer.tools, streaming: true },
+      { id: agentId, role: 'agent', text: '', streaming: true },
     ])
 
-    // Stream the prose, then reveal the structured payload — the same order a
-    // real agent produces it, and it stops the table from jumping mid-answer.
-    let i = 0
-    const full = answer.text
-    const timer = setInterval(() => {
-      i += 3
-      setMessages(prev => prev.map(m => m.id === agentId ? { ...m, text: full.slice(0, i) } : m))
-      if (i >= full.length) {
-        clearInterval(timer)
-        setMessages(prev => prev.map(m => m.id === agentId ? { ...m, ...answer, streaming: false } : m))
-        setBusy(false)
+    try {
+      const res = await fetch('/agent/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: `${sessionId}-${domain}`,
+          domain,
+          data_source: source ?? 'demo',
+          date_from: dateRange?.from.toISOString() ?? new Date(Date.now() - 86400000).toISOString(),
+          date_to: dateRange?.to.toISOString() ?? new Date().toISOString(),
+          message: q,
+          model,
+        }),
+      })
+
+      if (!res.ok) throw new Error(`Agent ${res.status}`)
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        for (const line of decoder.decode(value).split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6).trim()
+          if (payload === '[DONE]') break
+          try {
+            const parsed = JSON.parse(payload)
+            if (parsed.error) throw new Error(parsed.error)
+            if (parsed.token) {
+              setMessages(prev => prev.map(m =>
+                m.id === agentId ? { ...m, text: m.text + parsed.token } : m
+              ))
+            }
+            if (parsed.usage) {
+              const u = parsed.usage
+              const metric: AgentMetric = {
+                id: agentId,
+                timestamp: new Date().toISOString(),
+                sessionId,
+                domain,
+                model: u.model ?? model,
+                inputTokens: u.input ?? 0,
+                outputTokens: u.output ?? 0,
+                latencyMs: u.latency_ms ?? 0,
+                tokPerSec: u.tok_per_sec ?? 0,
+                questionSnippet: q.slice(0, 80),
+              }
+              onMetric?.(metric)
+              setMessages(prev => prev.map(m =>
+                m.id === agentId ? { ...m, inputTokens: metric.inputTokens, outputTokens: metric.outputTokens, latencyMs: metric.latencyMs, tokPerSec: metric.tokPerSec } : m
+              ))
+            }
+          } catch (innerErr) { throw innerErr }
+        }
       }
-    }, 16)
-  }, [logs, domain, busy])
+    } catch (err) {
+      // Fall back to demo answers when the agent service is not running.
+      const answer = answerQuestion(q, logs, domain)
+      let i = 0
+      await new Promise<void>(resolve => {
+        const timer = setInterval(() => {
+          i += 4
+          setMessages(prev => prev.map(m => m.id === agentId ? { ...m, text: answer.text.slice(0, i) } : m))
+          if (i >= answer.text.length) {
+            clearInterval(timer)
+            setMessages(prev => prev.map(m => m.id === agentId ? { ...m, ...answer } : m))
+            resolve()
+          }
+        }, 16)
+      })
+    }
+
+    setMessages(prev => prev.map(m => m.id === agentId ? { ...m, streaming: false } : m))
+    setBusy(false)
+  }, [logs, domain, source, dateRange, sessionId, busy, onMetric])
 
   if (!open) return null
 
@@ -2265,9 +2407,24 @@ function AskPanel({ open, onClose, logs, domain, model, wide, setWide }: {
         <div className="min-w-0 flex-1">
           <div className="mono text-[11px] text-[var(--c-text)] leading-none">LogSense Agent</div>
           <div className="mono text-[9px] text-[var(--c-faint)] truncate">
-            {currentModel.name} · {DOMAIN_BY_ID[domain]?.label ?? domain}
+            {DOMAIN_BY_ID[domain]?.label ?? domain}
           </div>
         </div>
+
+        {/* Model picker — shows real Ollama models when agent is reachable */}
+        <select
+          value={model}
+          onChange={e => setModel(e.target.value)}
+          className="mono text-[10px] rounded px-2 py-1 outline-none cursor-pointer"
+          style={{ background: a(C.purple, 0.1), border: `1px solid ${a(C.purple, 0.3)}`, color: C.purple, maxWidth: 140 }}
+          title="Select model"
+        >
+          {modelList.map(m => (
+            <option key={m.id} value={m.id} style={{ background: C.card, color: C.text }}>
+              {m.name}
+            </option>
+          ))}
+        </select>
         {messages.length > 0 && (
           <button onClick={() => setMessages([])} title="Clear conversation"
             className="mono text-[10px] px-1.5 py-1 rounded text-[var(--c-faint)] hover:text-[var(--c-dim)]">
@@ -2348,13 +2505,25 @@ function AskPanel({ open, onClose, logs, domain, model, wide, setWide }: {
                 </div>
               )}
 
-              {m.role === 'agent' && !m.streaming && m.tokens && (
-                <div className="mono text-[9px] text-[var(--c-faint)] mt-2.5 flex items-center gap-2">
+              {m.role === 'agent' && !m.streaming && (m.inputTokens != null || m.tokens) && (
+                <div className="mono text-[9px] text-[var(--c-faint)] mt-2.5 flex items-center gap-2 flex-wrap">
                   <span style={{ color: C.green }}>✓ finished</span>
                   <span>·</span>
-                  <span>{m.tokens.toLocaleString()} tokens</span>
-                  <span>·</span>
-                  <span>${m.cost?.toFixed(4)}</span>
+                  {m.inputTokens != null ? (
+                    <>
+                      <span>{m.inputTokens.toLocaleString()} in / {m.outputTokens?.toLocaleString()} out</span>
+                      <span>·</span>
+                      <span>{((m.latencyMs ?? 0) / 1000).toFixed(1)}s</span>
+                      <span>·</span>
+                      <span style={{ color: C.green }}>{m.tokPerSec} tok/s</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>~{m.tokens?.toLocaleString()} tokens</span>
+                      <span>·</span>
+                      <span className="opacity-50">demo mode</span>
+                    </>
+                  )}
                   <span>·</span>
                   <span>{currentModel.name}</span>
                 </div>
@@ -2922,28 +3091,28 @@ function AgentSection({ model, setModel, domain, setDomain }: {
   )
 }
 
-function PipelineSection({ domain, timeWindow, setTimeWindow, esServices }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; esServices?: Record<string, ServiceRollup[]> }) {
+function PipelineSection({ domain, timeWindow, setTimeWindow, data }: { domain: DomainFilter; timeWindow?: TimeWindow; setTimeWindow?: (w: TimeWindow) => void; data: ActiveData }) {
   const [tick, setTick] = useState(0)
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000)
     return () => clearInterval(id)
   }, [])
 
-  // Use real per-service event rates for throughput when available.
+  // Use real per-service event rates; on Elastic with no data yet show empty.
   const throughput = useMemo(() => {
-    const rollup = esServices?.[domain]
-    if (rollup?.length) {
-      const totalPerMin = rollup.reduce((n, s) => n + s.events, 0)
+    if (data.services?.length) {
+      const totalPerMin = data.services.reduce((n, s) => n + s.events, 0)
       return Array.from({ length: 30 }, (_, i) => ({
         t: i,
         rate: Math.round(totalPerMin / 60 * (1 + (seeded('pipe', i) - 0.5) * 0.1)),
       }))
     }
+    if (data.source !== 'demo') return []
     return Array.from({ length: 30 }, (_, i) => ({
       t: i,
       rate: Math.floor(280000 + Math.sin(i * 0.5) * 15000 + Math.random() * 8000),
     }))
-  }, [esServices, domain, tick])
+  }, [data.services, data.source, tick])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -3039,13 +3208,12 @@ function PipelineSection({ domain, timeWindow, setTimeWindow, esServices }: { do
           </thead>
           <tbody>
             {DOMAINS.filter(d => d.id === domain).map(d => {
-              const rollup = esServices?.[d.id]?.length ? esServices[d.id] : undefined
-              const usedEvPerSec = rollup
-                ? rollup.reduce((n, s) => n + s.events, 0) / 60
-                : d.share * 284
+              const isDemo = data.source === 'demo'
+              const realEvPerSec = data.services?.length ? data.services.reduce((n, s) => n + s.events, 0) / 60 : null
+              const usedEvPerSec = realEvPerSec ?? (isDemo ? d.share * 284 : 0)
               const used = usedEvPerSec
               const quota = used * 1.4
-              const pressure = used / quota
+              const pressure = quota > 0 ? used / quota : 0
               return (
                 <tr key={d.id} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
                   <td className="py-2">
@@ -3064,8 +3232,8 @@ function PipelineSection({ domain, timeWindow, setTimeWindow, esServices }: { do
                   <td className="py-2 text-[var(--c-dim)]">{d.policy.pii}</td>
                   <td className="py-2 text-[var(--c-cyan)]">{d.policy.residency}</td>
                   <td className="py-2 text-right text-[var(--c-dim)]">{d.policy.retention}</td>
-                  <td className="py-2 text-right" style={{ color: seeded(d.id, 3) > 0.6 ? C.amber : C.dim }}>
-                    {Math.floor(seeded(d.id, 3) * 180)}
+                  <td className="py-2 text-right" style={{ color: isDemo ? (seeded(d.id, 3) > 0.6 ? C.amber : C.dim) : C.faint }}>
+                    {isDemo ? Math.floor(seeded(d.id, 3) * 180) : '—'}
                   </td>
                 </tr>
               )
@@ -3799,24 +3967,24 @@ function TeamsSection({ logs, domain, setDomain, esServices }: {
 // Replaces both OverviewSection and TeamsSection. Shows summary KPIs then the
 // detailed per-service breakdown for the selected LoB.
 
-function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWindow }: {
+function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }: {
   logs: LogEntry[]
   domain: DomainFilter
   setDomain: (d: DomainFilter) => void
-  esServices?: Record<string, ServiceRollup[]>
+  data: ActiveData
   timeWindow?: TimeWindow
   setTimeWindow?: (w: TimeWindow) => void
 }) {
   const d = DOMAIN_BY_ID[domain]
   const profile = TEAM_PROFILES[domain]
-  // Only use live rollup when ES actually returned services; [] falls back to demo.
-  const liveRollup = esServices?.[domain]?.length ? esServices[domain] : undefined
+  const isElastic = data.source !== 'demo'
+  const liveRollup = data.services?.length ? data.services : undefined
   const domainLogs = logs.filter(l => l.domain === domain)
   const errLogs = domainLogs.filter(l => l.severity === 'CRITICAL' || l.severity === 'ERROR')
   const errorRate = domainLogs.length ? ((errLogs.length / domainLogs.length) * 100).toFixed(1) : '0.0'
 
-  // Use real ES rollup when available; fall back to seeded demo stats.
-  const svcList = liveRollup ? liveRollup.map(s => s.service) : d.services
+  // When on Elastic source: use real rollup if available, else show empty (not demo).
+  const svcList = liveRollup ? liveRollup.map(s => s.service) : (isElastic ? [] : d.services)
   const svcStats = liveRollup
     ? liveRollup.map(r => ({
         status: (r.errRate > 5 ? 'degraded' : r.errRate > 2 ? 'watch' : 'healthy') as 'healthy' | 'watch' | 'degraded',
@@ -3826,10 +3994,10 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
         runtime: 'live',
         version: 'v—',
       }))
-    : svcList.map(s => serviceStats(s))
+    : (isElastic ? [] : svcList.map(s => serviceStats(s)))
   const logRate = liveRollup
     ? liveRollup.reduce((n, s) => n + s.events, 0)
-    : Math.floor(d.share * 4200)
+    : (isElastic ? 0 : Math.floor(d.share * 4200))
   const active = svcStats.filter(s => s.status !== 'degraded')
   const inactive = svcStats.filter(s => s.status === 'degraded')
 
@@ -3886,6 +4054,11 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
           <span>Error budget</span><span className="text-right">Events/min</span><span className="text-right">Status</span>
         </div>
         <div className="flex flex-col gap-px">
+          {svcStats.length === 0 && isElastic && (
+            <div className="mono text-[11px] text-[var(--c-faint)] py-4 text-center">
+              {liveRollup === undefined ? 'Waiting for service aggregation… (updates every ~30s)' : 'No services found for this tenant in the selected time range.'}
+            </div>
+          )}
           {svcStats.map((s, si) => {
             const sc = s.status === 'degraded' ? C.red : s.status === 'watch' ? C.amber : C.green
             return (
@@ -3934,37 +4107,37 @@ function LobSection({ logs, domain, setDomain, esServices, timeWindow, setTimeWi
 
 // ─── SLASection ───────────────────────────────────────────────────────────────
 
-function SLASection({ domain, dateRange, timeWindow, esServices, esVolume }: {
+function SLASection({ domain, dateRange, timeWindow, data }: {
   domain: DomainFilter; dateRange?: DateRange; timeWindow?: TimeWindow
-  esServices?: Record<string, ServiceRollup[]>
-  esVolume?: Record<string, VolumeBucket[]>
+  data: ActiveData
 }) {
+  const isElastic = data.source !== 'demo'
   const slaRows = DOMAINS.map(d => {
-    const rollup = esServices?.[d.id]?.length ? esServices[d.id] : undefined
+    const rollup = data.allServices?.[d.id]?.length ? data.allServices[d.id] : undefined
     const realErrRate = rollup
       ? rollup.reduce((s, r) => s + r.errRate * r.events, 0) / Math.max(1, rollup.reduce((s, r) => s + r.events, 0))
       : null
-    const attainment = realErrRate !== null ? Number((100 - realErrRate).toFixed(2)) : d.slo.attainment
+    const attainment = realErrRate !== null ? Number((100 - realErrRate).toFixed(2)) : (isElastic ? null : d.slo.attainment)
     const targetPct = Number(d.slo.target.replace('%', ''))
     const sustainableErrRate = 100 - targetPct
     const burn = realErrRate !== null
       ? Number((realErrRate / Math.max(0.001, sustainableErrRate)).toFixed(1))
-      : d.slo.burn
-    const breachCount = Math.floor(seeded(d.id + 'breach', 0) * 8)
-    const trend = burn > 4 ? '↑' : burn > 1.5 ? '→' : '↓'
+      : (isElastic ? null : d.slo.burn)
+    const breachCount = isElastic ? null : Math.floor(seeded(d.id + 'breach', 0) * 8)
+    const trend = burn !== null ? (burn > 4 ? '↑' : burn > 1.5 ? '→' : '↓') : '—'
     return { d, attainment, burn, breachCount, trend }
   })
 
-  // Burn trend: derive from real volume error rates when available.
+  // Burn trend: real volume when available; empty on Elastic with no data; seeded only in demo mode.
   const burnTrend = useMemo(() => {
-    if (esVolume) {
-      const tenants = DOMAINS.filter(d => esVolume[d.id]?.length)
+    if (data.allVolume) {
+      const tenants = DOMAINS.filter(d => data.allVolume![d.id]?.length)
       if (tenants.length > 0) {
-        const maxLen = Math.max(...tenants.map(d => esVolume[d.id].length))
+        const maxLen = Math.max(...tenants.map(d => data.allVolume![d.id].length))
         return Array.from({ length: maxLen }, (_, i) => {
           const row: Record<string, number | string> = { time: '' }
           for (const d of DOMAINS) {
-            const buckets = esVolume[d.id]
+            const buckets = data.allVolume![d.id]
             if (!buckets?.length) continue
             const b = buckets[Math.min(i, buckets.length - 1)]
             row.time = b.time
@@ -3976,10 +4149,11 @@ function SLASection({ domain, dateRange, timeWindow, esServices, esVolume }: {
         })
       }
     }
+    if (isElastic) return []
     const to = dateRange ? dateRange.to.getTime() : Date.now()
     const from = dateRange ? dateRange.from.getTime() : to - 86_400_000
     return makeBurnTrend(from, to)
-  }, [dateRange, esVolume])
+  }, [dateRange, data.allVolume, isElastic])
 
   const BREACH_HISTORY = [
     { when: '16:03–16:18 UTC', lob: 'mps', desc: 'Auth success rate below 99.9% for 15m — conn pool exhausted', severity: 'critical', mttr: '18m' },
@@ -4001,8 +4175,8 @@ function SLASection({ domain, dateRange, timeWindow, esServices, esVolume }: {
         </div>
         <div className="flex flex-col gap-px">
           {slaRows.map(({ d, attainment, burn, breachCount, trend }) => {
-            const ok = attainment >= Number(d.slo.target.replace('%', ''))
-            const col = burn > 6 ? C.red : burn > 2 ? C.amber : C.green
+            const ok = attainment !== null && attainment >= Number(d.slo.target.replace('%', ''))
+            const col = burn === null ? C.faint : burn > 6 ? C.red : burn > 2 ? C.amber : C.green
             return (
               <div key={d.id} className="log-row grid gap-2 items-center px-1 py-2 rounded"
                 style={{ gridTemplateColumns: '140px 1fr 80px 80px 80px 60px', background: d.id === domain ? a(domainColor(d.id), 0.06) : 'transparent' }}>
@@ -4012,12 +4186,14 @@ function SLASection({ domain, dateRange, timeWindow, esServices, esVolume }: {
                 </div>
                 <span className="mono text-[10px] text-[var(--c-dim)] truncate">{d.slo.name}</span>
                 <span className="mono text-[11px] text-right text-[var(--c-dim)]">{d.slo.target}</span>
-                <span className="mono text-[11px] text-right" style={{ color: ok ? C.green : C.red }}>{attainment}%</span>
-                <span className="mono text-[11px] text-right flex items-center justify-end gap-1" style={{ color: col }}>
-                  {burn.toFixed(1)}× <span className="text-[10px]">{trend}</span>
+                <span className="mono text-[11px] text-right" style={{ color: attainment === null ? C.faint : ok ? C.green : C.red }}>
+                  {attainment !== null ? `${attainment}%` : '—'}
                 </span>
-                <span className="mono text-[11px] text-right" style={{ color: breachCount > 3 ? C.red : breachCount > 0 ? C.amber : C.dim }}>
-                  {breachCount}
+                <span className="mono text-[11px] text-right flex items-center justify-end gap-1" style={{ color: col }}>
+                  {burn !== null ? `${burn.toFixed(1)}×` : '—'} <span className="text-[10px]">{trend}</span>
+                </span>
+                <span className="mono text-[11px] text-right" style={{ color: breachCount === null ? C.faint : breachCount > 3 ? C.red : breachCount > 0 ? C.amber : C.dim }}>
+                  {breachCount !== null ? breachCount : '—'}
                 </span>
               </div>
             )
@@ -4469,6 +4645,169 @@ function CustomAgentSection({ domain, onAgentCreated }: {
   )
 }
 
+// ─── AI Agent Monitor ─────────────────────────────────────────────────────────
+
+function AIMonitorSection({ metrics }: { metrics: AgentMetric[] }) {
+  const totalTokens = metrics.reduce((n, m) => n + m.inputTokens + m.outputTokens, 0)
+  const avgLatencyMs = metrics.length ? Math.round(metrics.reduce((n, m) => n + m.latencyMs, 0) / metrics.length) : 0
+  const avgTokSec = metrics.length ? Number((metrics.reduce((n, m) => n + m.tokPerSec, 0) / metrics.length).toFixed(1)) : 0
+
+  const timeline = metrics.map((m, i) => ({
+    idx: i + 1,
+    label: new Date(m.timestamp).toLocaleTimeString(),
+    input: m.inputTokens,
+    output: m.outputTokens,
+  }))
+
+  const modelMap = new Map<string, { input: number; output: number; calls: number }>()
+  for (const m of metrics) {
+    const e = modelMap.get(m.model) ?? { input: 0, output: 0, calls: 0 }
+    e.input += m.inputTokens; e.output += m.outputTokens; e.calls++
+    modelMap.set(m.model, e)
+  }
+  const modelBreakdown = [...modelMap.entries()].map(([model, v]) => ({
+    model: model.replace(':latest', '').slice(0, 18),
+    input: v.input, output: v.output, calls: v.calls,
+  }))
+
+  const throughput = metrics.slice(-20).map((m, i) => ({ idx: i + 1, tokPerSec: m.tokPerSec }))
+  const peakTokSec = throughput.length ? Math.max(...throughput.map(t => t.tokPerSec)) : 0
+
+  if (metrics.length === 0) {
+    return (
+      <div className="flex flex-col h-full items-center justify-center gap-3">
+        <span className="text-3xl" style={{ color: C.faint }}>◉</span>
+        <div className="mono text-[12px] text-[var(--c-dim)]">No agent calls yet</div>
+        <div className="mono text-[11px] text-[var(--c-faint)] text-center" style={{ maxWidth: 300 }}>
+          Open the Ask panel (⌘K) and send a question — each real Ollama response will appear here with full observability metrics.
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
+      {/* KPI strip */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatCard label="Total Calls" value={String(metrics.length)} sub="this session" color={C.cyan} />
+        <StatCard label="Total Tokens" value={totalTokens >= 1000 ? `${(totalTokens / 1000).toFixed(1)}K` : String(totalTokens)} sub="input + output" color={C.purple} />
+        <StatCard label="Avg Latency" value={`${(avgLatencyMs / 1000).toFixed(1)}s`} sub="time to last token" color={C.amber} />
+        <StatCard label="Avg Throughput" value={`${avgTokSec}`} sub="tokens / sec" color={C.green} />
+      </div>
+
+      {/* Token usage timeline */}
+      <div className="card p-4">
+        <SectionHeader title="Token Usage Timeline" sub="input vs output tokens per call — newest right" />
+        <ResponsiveContainer width="100%" height={200}>
+          <AreaChart data={timeline} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
+            <defs>
+              <linearGradient id="gAIin" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={C.purple} stopOpacity={0.22} />
+                <stop offset="95%" stopColor={C.purple} stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id="gAIout" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={C.cyan} stopOpacity={0.22} />
+                <stop offset="95%" stopColor={C.cyan} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
+            <XAxis dataKey="idx" tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false}
+              label={{ value: 'call #', position: 'insideBottomRight', fill: C.faint, fontSize: 10 }} />
+            <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={44} />
+            <Tooltip content={<CustomTooltip />} />
+            <Area type="monotone" dataKey="input" stroke={C.purple} strokeWidth={1.5} fill="url(#gAIin)" name="input tokens" dot={false} />
+            <Area type="monotone" dataKey="output" stroke={C.cyan} strokeWidth={1.5} fill="url(#gAIout)" name="output tokens" dot={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+        <div className="flex gap-4 mt-2">
+          {[['Input tokens', C.purple], ['Output tokens', C.cyan]].map(([label, col]) => (
+            <div key={label as string} className="flex items-center gap-1.5">
+              <span className="w-3 h-0.5 rounded" style={{ background: col as string }} />
+              <span className="mono text-[10px] text-[var(--c-dim)]">{label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Model breakdown */}
+        <div className="card p-4">
+          <SectionHeader title="Model Breakdown" sub="tokens consumed per model" />
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={modelBreakdown} margin={{ top: 5, right: 8, bottom: 28, left: 0 }}>
+              <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
+              <XAxis dataKey="model" tick={{ fill: C.dim, fontSize: 9, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} angle={-15} textAnchor="end" interval={0} />
+              <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={40} />
+              <Tooltip content={<CustomTooltip />} />
+              <Bar dataKey="input" stackId="a" fill={C.purple} fillOpacity={0.8} name="input" />
+              <Bar dataKey="output" stackId="a" fill={C.cyan} fillOpacity={0.8} name="output" radius={[2, 2, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Throughput sparkline */}
+        <div className="card p-4">
+          <SectionHeader title="Generation Throughput" sub="tokens/sec — last 20 calls" />
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={throughput} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
+              <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
+              <XAxis dataKey="idx" tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} />
+              <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={40} />
+              <Tooltip content={<CustomTooltip />} formatter={(v: any) => [`${v} tok/s`, 'throughput']} />
+              {peakTokSec > 0 && (
+                <ReferenceLine y={peakTokSec} stroke={C.green} strokeDasharray="4 3" strokeWidth={1}
+                  label={{ value: `peak ${peakTokSec}`, fill: C.green, fontSize: 9, fontFamily: 'JetBrains Mono', position: 'insideTopRight' }} />
+              )}
+              <Line type="monotone" dataKey="tokPerSec" stroke={C.green} strokeWidth={2} dot={{ r: 3, fill: C.green }} name="tok/s" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Session log */}
+      <div className="card p-4">
+        <SectionHeader title="Session Log" sub={`${metrics.length} call${metrics.length !== 1 ? 's' : ''} · newest first`} />
+        <div className="overflow-x-auto">
+          <table className="w-full mono text-[10px]" style={{ minWidth: 700 }}>
+            <thead>
+              <tr className="text-[var(--c-faint)] uppercase tracking-widest"
+                style={{ borderBottom: `1px solid ${C.border}` }}>
+                {['Time', 'Domain', 'Model', 'Question', 'In', 'Out', 'Latency', 'tok/s'].map((h, i) => (
+                  <th key={h} className={`pb-2 font-medium ${i >= 4 ? 'text-right' : 'text-left'}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...metrics].reverse().map(m => {
+                const domDef = DOMAIN_BY_ID[m.domain as DomainId]
+                return (
+                  <tr key={m.id} className="hover:bg-[var(--c-row)]" style={{ borderTop: `1px solid ${C.border}` }}>
+                    <td className="py-1.5 pr-3 text-[var(--c-faint)] whitespace-nowrap">{new Date(m.timestamp).toLocaleTimeString()}</td>
+                    <td className="py-1.5 pr-3">
+                      {domDef && (
+                        <span className="mono text-[9px] px-1 rounded"
+                          style={{ background: a(domainColor(m.domain as DomainId), 0.14), color: domainColor(m.domain as DomainId) }}>
+                          {domDef.short}
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-1.5 pr-3 text-[var(--c-cyan)] whitespace-nowrap">{m.model.replace(':latest', '').slice(0, 22)}</td>
+                    <td className="py-1.5 pr-3 text-[var(--c-dim)] max-w-[200px] truncate">{m.questionSnippet}</td>
+                    <td className="py-1.5 text-right text-[var(--c-dim)]">{m.inputTokens.toLocaleString()}</td>
+                    <td className="py-1.5 text-right" style={{ color: C.cyan }}>{m.outputTokens.toLocaleString()}</td>
+                    <td className="py-1.5 text-right" style={{ color: m.latencyMs > 10000 ? C.amber : C.dim }}>{(m.latencyMs / 1000).toFixed(1)}s</td>
+                    <td className="py-1.5 text-right" style={{ color: C.green }}>{m.tokPerSec}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 const NAV_ITEMS: { id: NavSection; label: string; icon: string; badge?: string }[] = [
   { id: 'lob', label: 'LoB', icon: '⊞' },
   { id: 'logs', label: 'Log Stream', icon: '≡' },
@@ -4478,6 +4817,7 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: string; badge?: string }
   { id: 'rca', label: 'RCA Agent', icon: '⊕' },
   { id: 'agent', label: 'Custom Agent', icon: '◈' },
   { id: 'pipeline', label: 'Pipeline', icon: '⊳' },
+  { id: 'aimonitor', label: 'AI Monitor', icon: '◉' },
 ]
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
@@ -4500,6 +4840,7 @@ export default function App() {
   }
   const [model, setModel] = useState('claude-sonnet-5')
   const [customAgents, setCustomAgents] = useState<CustomAgentDef[]>([])
+  const [agentMetrics, setAgentMetrics] = useState<AgentMetric[]>([])
   const [domain, setDomain] = useState<DomainFilter>('mps')
   const [source, setSource] = useState<DataSource>(
     () => (import.meta.env.VITE_DATA_SOURCE === 'elastic' ? 'elastic' : 'demo')
@@ -4579,6 +4920,7 @@ export default function App() {
 
   const currentModel = LLM_MODELS.find(m => m.id === model) || LLM_MODELS[0]
   const activeLogs = source === 'elastic' ? es.logs : logs
+  const activeData = useActiveData(source, domain, es)
   const visibleLogs = activeLogs.filter(l => l.domain === domain)
 
   /** Reshape per-tenant Elastic histograms into the stacked-area row format. */
@@ -4802,15 +5144,16 @@ export default function App() {
           })()}
           <div className="flex-1 min-h-0 overflow-hidden">
           {section === 'lob' && (
-            <LobSection logs={activeLogs} domain={domain} setDomain={setDomain} esServices={source === 'elastic' ? es.services : undefined} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
+            <LobSection logs={activeLogs} domain={domain} setDomain={setDomain} data={activeData} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
           )}
           {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={domain} />}
-          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esErrorTypes={source === 'elastic' ? es.errorTypes[domain] : undefined} esVolume={source === 'elastic' ? es.volume[domain] : undefined} />}
-          {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esVolume={source === 'elastic' ? es.volume[domain] : undefined} />}
-          {section === 'sla' && <SLASection domain={domain} dateRange={dateRange} timeWindow={timeWindow} esServices={source === 'elastic' ? es.services : undefined} esVolume={source === 'elastic' ? es.volume : undefined} />}
+          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'sla' && <SLASection domain={domain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
           {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={domain} setDomain={setDomain} />}
           {section === 'agent' && <CustomAgentSection domain={domain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
-          {section === 'pipeline' && <PipelineSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} esServices={source === 'elastic' ? es.services : undefined} />}
+          {section === 'pipeline' && <PipelineSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'aimonitor' && <AIMonitorSection metrics={agentMetrics} />}
           </div>
         </main>
       </div>
@@ -4821,8 +5164,12 @@ export default function App() {
         logs={visibleLogs}
         domain={domain}
         model={model}
+        setModel={setModel}
         wide={askWide}
         setWide={setAskWide}
+        source={source}
+        dateRange={dateRange}
+        onMetric={m => setAgentMetrics(prev => [...prev.slice(-499), m])}
       />
     </div>
   )

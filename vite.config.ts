@@ -11,6 +11,9 @@ export default defineConfig(({ mode }) => {
   const fileEnv = loadEnv(mode, process.cwd(), '')
   const env = { ...process.env, ...fileEnv }
 
+  // Allow the Node.js proxy process to connect to ES with a self-signed cert.
+  if (env.ES_INSECURE === 'true') process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+
   // .figma/make/deploy-preview passes `--mode development` for cached-preview builds.
   const emitSourcemaps = mode === 'development'
 
@@ -47,6 +50,9 @@ export default defineConfig(({ mode }) => {
             secure: env.ES_INSECURE !== 'true',
             rewrite: (p: string) => p.replace(/^\/es/, ''),
             configure: (proxy: any) => {
+              proxy.on('error', (_err: any, _req: any, res: any) => {
+                try { if (res && !res.headersSent) { res.writeHead(502); res.end() } } catch {}
+              })
               proxy.on('proxyReq', (proxyReq: any) => {
                 if (env.ES_API_KEY) {
                   proxyReq.setHeader('Authorization', `ApiKey ${env.ES_API_KEY}`)
@@ -61,6 +67,9 @@ export default defineConfig(({ mode }) => {
         ...(env.UPLOAD_URL ? {
           '/upload': { target: env.UPLOAD_URL, changeOrigin: true },
           '/status': { target: env.UPLOAD_URL, changeOrigin: true },
+        } : {}),
+        ...(env.AGENT_URL ? {
+          '/agent': { target: env.AGENT_URL, changeOrigin: true },
         } : {}),
       },
     },
