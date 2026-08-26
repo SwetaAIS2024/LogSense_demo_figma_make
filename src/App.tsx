@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react'
+import type { ReactNode, ErrorInfo } from 'react'
 import {
   AreaChart, Area, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ScatterChart,
@@ -735,10 +736,6 @@ interface CustomAgentDef {
   createdAt: string
 }
 
-const API = "https://geuxedpujvockbvdrhoq.supabase.co/functions/v1/make-server-637cd706"
-const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdldXhlZHB1anZvY2tidmRyaG9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MTMyOTUsImV4cCI6MjEwMTQ4OTI5NX0.gq5GPxUVy8SGjiW4ZzwwlMTLlMex31eLph95v7N8tDo"
-const API_HEADERS = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ANON_KEY}` }
-
 const LS_KEY = 'logsense-custom-agents'
 
 function lsLoad(): CustomAgentDef[] {
@@ -749,27 +746,24 @@ function lsSave(agents: CustomAgentDef[]) {
 }
 
 async function fetchAgents(): Promise<CustomAgentDef[]> {
-  // Always return localStorage immediately; try to hydrate from DB in background
+  // localStorage is the instant cache; Postgres via /agent/agents is the source of truth.
   const local = lsLoad()
   try {
-    const r = await fetch(`${API}/agents`, { headers: API_HEADERS })
-    if (r.ok) {
-      const remote: CustomAgentDef[] = await r.json()
-      if (Array.isArray(remote) && remote.length >= local.length) {
-        lsSave(remote)
-        return remote
-      }
+    const remote: CustomAgentDef[] = await fetch('/agent/agents').then(r => r.json())
+    if (Array.isArray(remote) && remote.length >= local.length) {
+      lsSave(remote)
+      return remote
     }
-  } catch { /* use local */ }
+  } catch { /* use local cache */ }
   return local
 }
 
 async function saveAgents(agents: CustomAgentDef[]): Promise<void> {
   lsSave(agents)
   try {
-    await fetch(`${API}/agents`, {
+    await fetch('/agent/agents', {
       method: 'POST',
-      headers: API_HEADERS,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(agents),
     })
   } catch { /* localStorage already saved */ }
@@ -1098,7 +1092,7 @@ function OverviewSection({ logs, domain, setDomain, volumeData, errorDist }: {
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
       {/* KPI row */}
       <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-6 gap-3">
-        <StatCard label="Total Events" value={`${(DOMAIN_BY_ID[domain].share * 284).toFixed(0)}K`} sub="last 24h" delta="+12.4%" />
+        <StatCard label="Total Events" value={`${((DOMAIN_BY_ID[domain]?.share ?? 0.25) * 284).toFixed(0)}K`} sub="last 24h" delta="+12.4%" />
         <StatCard label="Error Rate" value={`${errorRate}%`} sub="of all events" color={C.red} delta="+0.8%" />
         <StatCard label="Budget Burn" value={`${worstBurn.toFixed(1)}×`} sub="vs 1× sustainable" color={worstBurn > 6 ? C.red : C.amber} />
         <StatCard label="Critical" value={String(counts.CRITICAL || 0)} sub="events" color={C.red} />
@@ -1108,7 +1102,7 @@ function OverviewSection({ logs, domain, setDomain, volumeData, errorDist }: {
 
       {/* Volume chart, stacked by tenant */}
       <div className="card p-4 flex-shrink-0">
-        <SectionHeader title="Log Volume" sub={`24h rolling window — ${DOMAIN_BY_ID[domain].label}`} />
+        <SectionHeader title="Log Volume" sub={`24h rolling window — ${DOMAIN_BY_ID[domain]?.label ?? domain}`} />
         <ResponsiveContainer width="100%" height={168}>
           <AreaChart data={volume} margin={{ top: 5, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
@@ -1347,7 +1341,7 @@ function LogsSection({ logs, live, domain }: { logs: LogEntry[], live: boolean, 
                 <span className="text-[var(--c-faint)] truncate">{log.timestamp.replace('T', ' ').slice(0, 19)}</span>
                 <span className="text-[9px] px-1 rounded self-center justify-self-start"
                   style={{ background: a(domainColor(log.domain), 0.14), color: domainColor(log.domain) }}>
-                  {DOMAIN_BY_ID[log.domain].short}
+                  {DOMAIN_BY_ID[log.domain]?.short ?? log.domain}
                 </span>
                 <SeverityBadge sev={log.severity} />
                 <span className="text-[var(--c-cyan)] truncate">{log.service}</span>
@@ -1681,7 +1675,7 @@ function AnomalySection({ domain, timeWindow, setTimeWindow, data }: { domain: D
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1">
-                  <span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(dom), 0.14), color: domainColor(dom) }}>{DOMAIN_BY_ID[dom].short}</span>
+                  <span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(dom), 0.14), color: domainColor(dom) }}>{DOMAIN_BY_ID[dom]?.short ?? dom}</span>
                   <span className="mono text-[11px] font-semibold text-[var(--c-text)]">{type}</span>
                   <span className="mono text-[11px] text-[var(--c-cyan)]">{service}</span>
                   <span className="mono text-[9px] text-[var(--c-faint)]">baseline: {baseline}</span>
@@ -1775,8 +1769,8 @@ function RCASection({ domain, setDomain, timeWindow = '1h', setTimeWindow }: { d
                 }}
               >
                 <div className="flex items-center gap-1.5 mb-1">
-                  <span style={{ color: col }}>{DOMAIN_BY_ID[dom].icon}</span>
-                  <span className="mono text-[10px]" style={{ color: col }}>{DOMAIN_BY_ID[dom].short}</span>
+                  <span style={{ color: col }}>{DOMAIN_BY_ID[dom]?.icon ?? dom}</span>
+                  <span className="mono text-[10px]" style={{ color: col }}>{DOMAIN_BY_ID[dom]?.short ?? dom}</span>
                   <span className="mono text-[9px] ml-auto px-1 rounded"
                     style={{
                       background: role === 'origin' ? a(C.red, 0.15) : role === 'contained' ? a(C.green, 0.12) : a(C.amber, 0.12),
@@ -1850,7 +1844,7 @@ function RCASection({ domain, setDomain, timeWindow = '1h', setTimeWindow }: { d
                     fontSize="1.5%" fill={domainColor(node.dom)}
                     fontFamily="JetBrains Mono"
                   >
-                    {DOMAIN_BY_ID[node.dom].short}
+                    {DOMAIN_BY_ID[node.dom]?.short ?? node.dom}
                   </text>
                 </g>
               )
@@ -1877,7 +1871,7 @@ function RCASection({ domain, setDomain, timeWindow = '1h', setTimeWindow }: { d
                 <span className="mono text-sm font-semibold text-[var(--c-text)]">{selectedNode}</span>
                 {selDom && (
                   <span className="mono text-[10px] px-1.5 py-0.5 rounded" style={{ background: a(domainColor(selDom), 0.14), color: domainColor(selDom) }}>
-                    {DOMAIN_BY_ID[selDom].short}
+                    {DOMAIN_BY_ID[selDom]?.short ?? selDom}
                   </span>
                 )}
                 <div
@@ -2019,7 +2013,7 @@ function esQuery(index: string, body: string) {
 /** Deterministic responder over the live buffer — no fabricated numbers. */
 function answerQuestion(q: string, logs: LogEntry[], domain: DomainFilter): Omit<ChatMsg, 'id' | 'role'> {
   const scope = [DOMAIN_BY_ID[domain]]
-  const scopeLabel = DOMAIN_BY_ID[domain].label
+                  const scopeLabel = DOMAIN_BY_ID[domain]?.label ?? domain
   const indices = scope.map(d => d.index ?? `logs-${d.id}-*`).join(',')
   const t = q.toLowerCase()
   const isErr = (l: LogEntry) => l.severity === 'CRITICAL' || l.severity === 'ERROR'
@@ -2633,118 +2627,211 @@ const AGENT_RUNS = [
   { id: 'run_5c88fe', when: 'Yesterday', tenant: 'mps', model: 'Claude Sonnet 5', cost: 0.29, verdict: 'Expired mTLS cert on tokenisation-svc', decision: 'approved', mttr: '22m' },
 ]
 
-function AgentSection({ model, setModel, domain, setDomain }: {
-  model: string; setModel: (m: string) => void; domain: DomainFilter; setDomain: (d: DomainFilter) => void
+// ─── Audit Trail ─────────────────────────────────────────────────────────────
+
+function AuditTrail({ source }: { source?: DataSource }) {
+  const [realRuns, setRealRuns] = useState<{ id: string; domain: string; status: string; rootCause: string; confidence: number; createdAt: string }[]>([])
+
+  useEffect(() => {
+    if (!source || source === 'demo') return
+    fetch('/agent/rca/history?limit=20')
+      .then(r => r.json())
+      .then(rows => { if (Array.isArray(rows)) setRealRuns(rows) })
+      .catch(() => {})
+  }, [source])
+
+  const isDemo = !source || source === 'demo'
+
+  return (
+    <div className="card p-4">
+      <SectionHeader title="Run Audit Trail" sub={isDemo ? 'demo history' : 'from Postgres — every run replayable'} />
+      {!isDemo && realRuns.length === 0 ? (
+        <div className="mono text-[11px] text-[var(--c-faint)] py-4 text-center">No completed RCA runs yet — run the agent and approve the gate to persist a record here.</div>
+      ) : (
+        <table className="w-full text-[11px] mono">
+          <thead>
+            <tr className="text-[var(--c-faint)] text-[10px] uppercase tracking-widest border-b border-[var(--c-border)]">
+              <th className="text-left pb-2 font-medium">Run</th>
+              <th className="text-left pb-2 font-medium">Domain</th>
+              <th className="text-left pb-2 font-medium">Root Cause</th>
+              <th className="text-right pb-2 font-medium">Conf.</th>
+              <th className="text-right pb-2 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {isDemo
+              ? AGENT_RUNS.map(r => (
+                  <tr key={r.id} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
+                    <td className="py-2 text-[var(--c-cyan)]">{r.id}<span className="text-[var(--c-faint)]"> · {r.when}</span></td>
+                    <td className="py-2"><span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(r.tenant as DomainId), 0.14), color: domainColor(r.tenant as DomainId) }}>{DOMAIN_BY_ID[r.tenant as DomainId]?.short ?? r.tenant}</span></td>
+                    <td className="py-2 text-[var(--c-text2)]">{r.verdict}</td>
+                    <td className="py-2 text-right text-[var(--c-dim)]">—</td>
+                    <td className="py-2 text-right" style={{ color: r.decision === 'approved' ? C.green : C.red }}>{r.decision}</td>
+                  </tr>
+                ))
+              : realRuns.map(r => (
+                  <tr key={r.id} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
+                    <td className="py-2 text-[var(--c-cyan)]">{r.id}<span className="text-[var(--c-faint)]"> · {new Date(r.createdAt).toLocaleTimeString()}</span></td>
+                    <td className="py-2"><span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(r.domain as DomainId), 0.14), color: domainColor(r.domain as DomainId) }}>{DOMAIN_BY_ID[r.domain as DomainId]?.short ?? r.domain}</span></td>
+                    <td className="py-2 text-[var(--c-text2)] max-w-xs truncate">{r.rootCause}</td>
+                    <td className="py-2 text-right text-[var(--c-dim)]">{r.confidence > 0 ? `${(r.confidence * 100).toFixed(0)}%` : '—'}</td>
+                    <td className="py-2 text-right" style={{ color: r.status === 'complete' ? C.green : C.amber }}>{r.status}</td>
+                  </tr>
+                ))
+            }
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function AgentSection({ model, setModel, domain, setDomain, source, dateRange }: {
+  model: string; setModel: (m: string) => void; domain: DomainFilter; setDomain: (d: DomainFilter) => void; source?: DataSource; dateRange?: DateRange
 }) {
   const [running, setRunning] = useState(false)
   const [steps, setSteps] = useState<AgentStep[]>([])
   const [streamText, setStreamText] = useState('')
   const [showModelMenu, setShowModelMenu] = useState(false)
   const [gate, setGate] = useState<'idle' | 'awaiting' | 'approved' | 'rejected'>('idle')
+  const [gateRunId, setGateRunId] = useState<string | null>(null)
+  const [rcaDone, setRcaDone] = useState<{ root_cause?: string; confidence?: number; actions?: string[] } | null>(null)
+  const [ollamaModels, setOllamaModels] = useState<{ id: string; name: string; icon: string; provider: string }[]>([])
   const resume = useRef<(() => void) | null>(null)
 
-  const currentModel = LLM_MODELS.find(m => m.id === model) || LLM_MODELS[0]
+  // Fetch real Ollama models when on Elastic source; fall back to static list for demo.
+  useEffect(() => {
+    if (!source || source === 'demo') return
+    fetch('/agent/models')
+      .then(r => r.json())
+      .then(j => {
+        if (j.ok && j.models.length) {
+          setOllamaModels(j.models.map((m: { id: string; name: string }) => ({
+            id: m.id, name: m.name, icon: '⬡', provider: 'Ollama',
+          })))
+        }
+      })
+      .catch(() => {})
+  }, [source])
+
+  const modelList = (source && source !== 'demo' && ollamaModels.length) ? ollamaModels : LLM_MODELS
+  const currentModel = modelList.find(m => m.id === model) || modelList[0]
   const incidentTenant: DomainId = domain
   const tenant = DOMAIN_BY_ID[incidentTenant]
 
-  const AGENT_STEPS: Omit<AgentStep, 'status'>[] = [
-    {
-      id: '1', phase: 'Scope & Ground', tool: 'search_logs(tenant, 30m)', routed: 'fast',
-      tokensIn: 18400, tokensOut: 240, latency: 1.9, confidence: 1,
-      citations: ['log:9fa21c', 'log:71bb04', 'trace:8c4d19a2f0'],
-      content: `Pulled 41,208 events for ${tenant.label} (last 30m) plus the 3 LoBs sharing a dependency edge. Redaction applied at prompt build: 1,204 identifiers masked. Retained 38 exemplar events after dedup by fingerprint.`,
-    },
-    {
-      id: '2', phase: 'Correlate Tenants', tool: 'correlate_tenants()', routed: 'fast',
-      tokensIn: 9100, tokensOut: 380, latency: 2.4, confidence: 0.92,
-      citations: ['fp:ERR-upstream-timeout-5s', 'trace:8c4d19a2f0', 'log:41c802'],
-      content: 'Fingerprint ERR-upstream-timeout-5s appears in PIS (16:01), MPS (15:56) and MRD (16:12). Onset ordering puts MPS first by 5m. Shared dependency: psp-adapter → ledger-db pool. MRD contact is coincidental (different pool).',
-    },
-    {
-      id: '3', phase: 'Hypothesise', tool: 'rank_hypotheses()', routed: 'reasoning',
-      tokensIn: 12600, tokensOut: 720, latency: 4.1, confidence: 0.81,
-      citations: ['log:71bb04', 'deploy:payment-svc@v2.14.1', 'metric:pool.active'],
-      content: 'Ranked 6 candidates:\n  1. 0.81 — payment-svc v2.14.1 leaks pool connections; entitlement reads share that pool\n  2. 0.44 — acquirer latency holds connections open long enough to exhaust the pool\n  3. 0.22 — entitlement store lacks a circuit breaker, so it queues instead of shedding\n4 candidates eliminated (see Ruled Out).',
-    },
-    {
-      id: '4', phase: 'Validate', tool: 'run_query() · fetch_heap()', routed: 'reasoning',
-      tokensIn: 15200, tokensOut: 610, latency: 5.6, confidence: 0.94,
-      citations: ['heap:payment-svc-5d9f8b', 'metric:pool.active', 'log:71bb04'],
-      content: 'H1 confirmed: heap dump shows 847 unclosed PreparedStatement objects; pool.active grows +3.4/min from deploy +3m with zero decay. H2 partially confirmed (accelerant, not cause). H3 confirmed as a severity multiplier, not a trigger.',
-    },
-    {
-      id: '5', phase: 'Root Cause', tool: 'conclude_rca()', routed: 'reasoning',
-      tokensIn: 8800, tokensOut: 540, latency: 3.2, confidence: 0.94,
-      citations: ['heap:payment-svc-5d9f8b', 'deploy:payment-svc@v2.14.1', 'log:9fa21c'],
-      content: 'ROOT CAUSE (94% confidence)\n• Primary: connection leak in payment-svc v2.14.1 — missing release() on the capture path (payment/process.ts:482)\n• Cross-LoB path: PIS journey-api calls MPS token endpoint synchronously; pool exhaustion in MPS blanks passenger display screens\n• Amplifier: no circuit breaker on journey-api → MPS auth call\n• Trigger: 100% rollout of v2.14.1 completed 15:48 UTC',
-    },
-    {
-      id: '6', phase: 'Remediate', tool: 'propose_actions() → human gate', routed: 'reasoning', gate: true,
-      tokensIn: 6400, tokensOut: 480, latency: 2.8, confidence: 0.9,
-      citations: ['runbook:PAY-014', 'change:CHG-9921'],
-      content: 'PROPOSED (requires human approval — the agent holds no write credentials):\n  P0 · Roll back payment-svc → v2.13.9  [blast radius: MPS, PIS · est. recovery 8-12m]\n  P0 · Raise ledger-db pool ceiling 512 → 640 as a holding action\n  P1 · Ship release() fix at payment/process.ts:482\n  P1 · Add circuit breaker on PIS journey-api → MPS auth call\n  P2 · Add cross-LoB error-rate gate to the MPS canary',
-    },
-    {
-      id: '7', phase: 'Report & Learn', tool: 'write_postmortem() · add_detector()', routed: 'fast',
-      tokensIn: 7200, tokensOut: 690, latency: 2.1, confidence: 1,
-      citations: ['inc:INC-2847', 'detector:pool-share-guard'],
-      content: 'Postmortem drafted against INC-2847 and shared with MPS + PIS. Filed 3 tickets. New detector registered: alert when two LoBs share a saturating pool for >60s — this class of incident is now caught before it reaches passenger display screens.',
-    },
-  ]
-
-  const startAgent = useCallback(() => {
+  const startAgent = useCallback(async () => {
     setRunning(true)
     setSteps([])
     setStreamText('')
     setGate('idle')
+    setGateRunId(null)
+    setRcaDone(null)
 
-    let stepIdx = 0
-    const processStep = () => {
-      if (stepIdx >= AGENT_STEPS.length) {
-        setRunning(false)
-        return
+    // Demo mode: synthetic animation (no real backend needed)
+    if (!source || source === 'demo') {
+      const DEMO_STEPS: Omit<AgentStep, 'status'>[] = [
+        { id:'1', phase:'Scope & Ground', tool:'search_logs(tenant, 30m)', routed:'fast', tokensIn:18400, tokensOut:240, latency:1.9, confidence:1, citations:['log:9fa21c','log:71bb04','trace:8c4d19a2f0'], content:`Pulled 41,208 events for ${tenant.label} (last 30m) plus 3 LoBs sharing a dependency edge. Redaction applied: 1,204 identifiers masked. 38 exemplar events retained after dedup.` },
+        { id:'2', phase:'Correlate Tenants', tool:'correlate_tenants()', routed:'fast', tokensIn:9100, tokensOut:380, latency:2.4, confidence:0.92, citations:['fp:ERR-upstream-timeout-5s','trace:8c4d19a2f0','log:41c802'], content:'Fingerprint ERR-upstream-timeout-5s in PIS (16:01), MPS (15:56), MRD (16:12). Onset ordering puts MPS first by 5m. Shared dependency: psp-adapter → ledger-db pool.' },
+        { id:'3', phase:'Hypothesise', tool:'rank_hypotheses()', routed:'reasoning', tokensIn:12600, tokensOut:720, latency:4.1, confidence:0.81, citations:['log:71bb04','deploy:payment-svc@v2.14.1','metric:pool.active'], content:'Ranked 6 candidates:\n  1. 0.81 — payment-svc v2.14.1 leaks pool connections\n  2. 0.44 — acquirer latency holds connections open\n  3. 0.22 — no circuit breaker queues instead of shedding' },
+        { id:'4', phase:'Validate', tool:'run_query() · fetch_heap()', routed:'reasoning', tokensIn:15200, tokensOut:610, latency:5.6, confidence:0.94, citations:['heap:payment-svc-5d9f8b','metric:pool.active','log:71bb04'], content:'H1 confirmed: heap dump shows 847 unclosed PreparedStatement objects. pool.active grows +3.4/min from deploy +3m with zero decay.' },
+        { id:'5', phase:'Root Cause', tool:'conclude_rca()', routed:'reasoning', tokensIn:8800, tokensOut:540, latency:3.2, confidence:0.94, citations:['heap:payment-svc-5d9f8b','deploy:payment-svc@v2.14.1','log:9fa21c'], content:'ROOT CAUSE (94%)\n• Connection leak in payment-svc v2.14.1 — missing release() at payment/process.ts:482\n• PIS journey-api calls MPS token endpoint synchronously → blank passenger screens\n• Trigger: 100% rollout at 15:48 UTC' },
+        { id:'6', phase:'Remediate', tool:'propose_actions() → human gate', routed:'reasoning', gate:true, tokensIn:6400, tokensOut:480, latency:2.8, confidence:0.9, citations:['runbook:PAY-014','change:CHG-9921'], content:'PROPOSED (human approval required):\n  P0 · Rollback payment-svc → v2.13.9  [recovery ~10m]\n  P0 · Raise ledger-db pool 512 → 640\n  P1 · Fix release() at payment/process.ts:482\n  P1 · Circuit breaker on PIS → MPS auth' },
+        { id:'7', phase:'Report & Learn', tool:'write_postmortem() · add_detector()', routed:'fast', tokensIn:7200, tokensOut:690, latency:2.1, confidence:1, citations:['inc:INC-2847','detector:pool-share-guard'], content:'Postmortem drafted against INC-2847. 3 tickets filed. New detector: alert when two LoBs share a saturating pool for >60s.' },
+      ]
+      let stepIdx = 0
+      const processStep = () => {
+        if (stepIdx >= DEMO_STEPS.length) { setRunning(false); return }
+        const step = DEMO_STEPS[stepIdx]
+        setSteps(prev => [...prev, { ...step, status: 'running' }])
+        setStreamText('')
+        let ci = 0
+        const content = step.content
+        const iv = setInterval(() => {
+          ci += 3
+          setStreamText(content.slice(0, ci))
+          if (ci >= content.length) {
+            clearInterval(iv)
+            const advance = () => {
+              setSteps(prev => prev.map(s => s.id === step.id ? { ...s, status: 'done', content } : s))
+              stepIdx++
+              setTimeout(processStep, 400)
+            }
+            if (step.gate) {
+              setSteps(prev => prev.map(s => s.id === step.id ? { ...s, status: 'blocked', content } : s))
+              setGate('awaiting')
+              setRunning(false)
+              resume.current = () => { setRunning(true); advance() }
+            } else { advance() }
+          }
+        }, 10)
       }
-      const step = AGENT_STEPS[stepIdx]
-      setSteps(prev => [...prev, { ...step, status: 'running' }])
-      setStreamText('')
-
-      let charIdx = 0
-      const content = step.content
-      const stream = setInterval(() => {
-        charIdx += 2
-        setStreamText(content.slice(0, charIdx))
-        if (charIdx >= content.length) {
-          clearInterval(stream)
-          const advance = () => {
-            setSteps(prev => prev.map(s => s.id === step.id ? { ...s, status: 'done', content } : s))
-            stepIdx++
-            setTimeout(processStep, 500)
-          }
-          if (step.gate) {
-            // Hard stop: no further tool calls until a human decides.
-            setSteps(prev => prev.map(s => s.id === step.id ? { ...s, status: 'blocked', content } : s))
-            setGate('awaiting')
-            setRunning(false)
-            resume.current = () => { setRunning(true); advance() }
-          } else {
-            advance()
-          }
-        }
-      }, 10)
+      processStep()
+      return
     }
-    processStep()
-  }, [model, incidentTenant])
 
-  const approve = () => {
+    // Elastic / File mode: real backend investigation
+    try {
+      const res = await fetch('/agent/rca', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          domain: incidentTenant,
+          date_from: dateRange?.from.toISOString() ?? new Date(Date.now() - 365 * 86400000).toISOString(),
+          model,
+        }),
+      })
+      if (!res.ok) throw new Error(`RCA ${res.status}`)
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        for (const line of decoder.decode(value).split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6).trim()
+          if (payload === '[DONE]') break
+          try {
+            const parsed = JSON.parse(payload)
+            if (parsed.step) {
+              const s = parsed.step
+              const agentStep: AgentStep = { id:s.id, phase:s.phase, tool:s.tool, content:s.content, status:s.status, routed:s.routed??'fast', tokensIn:s.tokensIn??0, tokensOut:s.tokensOut??0, latency:s.latency??0, confidence:s.confidence, citations:s.citations??[] }
+              if (s.status === 'running') { setSteps(prev => [...prev, agentStep]) }
+              else { setSteps(prev => { const exists = prev.find(x => x.id === s.id); return exists ? prev.map(x => x.id === s.id ? agentStep : x) : [...prev, agentStep] }) }
+            }
+            if (parsed.gate) { setGate('awaiting'); setGateRunId(parsed.gate.run_id); setRunning(false) }
+            if (parsed.done) { if (!parsed.done.rejected) setRcaDone(parsed.done); setRunning(false) }
+          } catch {}
+        }
+      }
+    } catch { setRunning(false) }
+    setRunning(false)
+  }, [model, incidentTenant, source, dateRange])
+
+  const approve = async () => {
+    if (source === 'demo' || !gateRunId) {
+      // Demo mode: resume local simulation
+      setGate('approved')
+      setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'done' } : s))
+      resume.current?.()
+      resume.current = null
+      return
+    }
     setGate('approved')
     setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'done' } : s))
-    resume.current?.()
-    resume.current = null
+    setRunning(true)
+    await fetch(`/agent/rca/${gateRunId}/approve`, { method: 'POST' })
   }
-  const reject = () => {
+  const reject = async () => {
+    if (source === 'demo' || !gateRunId) {
+      setGate('rejected')
+      setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'rejected' } : s))
+      resume.current = null
+      setRunning(false)
+      return
+    }
     setGate('rejected')
     setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'rejected' } : s))
-    resume.current = null
+    await fetch(`/agent/rca/${gateRunId}/reject`, { method: 'POST' })
     setRunning(false)
   }
 
@@ -2759,7 +2846,7 @@ function AgentSection({ model, setModel, domain, setDomain }: {
   )
   const budget = 0.6
   const citationCount = steps.flatMap(s => s.citations ?? []).length
-  const complete = steps.length === AGENT_STEPS.length && !running
+  const complete = (source === 'demo' ? steps.length === 7 : rcaDone !== null) && !running
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -2797,57 +2884,32 @@ function AgentSection({ model, setModel, domain, setDomain }: {
             <div className="absolute right-0 top-full mt-1 z-50 rounded"
               style={{ background: C.card, border: `1px solid ${C.border}`, minWidth: 260 }}>
               <div className="mono text-[9px] text-[var(--c-faint)] uppercase tracking-widest px-3 pt-2 pb-1">
-                Reasoning model · $/1M tok in/out
+                {source && source !== 'demo' ? 'Ollama models (downloaded)' : 'Reasoning model · $/1M tok in/out'}
               </div>
-              {/* Frontier / proprietary */}
-              <div className="mono text-[9px] text-[var(--c-dim)] uppercase tracking-widest px-3 pt-1 pb-0.5" style={{ borderTop: `1px solid ${C.border}` }}>
-                Frontier
-              </div>
-              {LLM_MODELS.filter(m => !['qwen3-235b','qwen3-32b','kimi-k2','glm-4-32b','glm-z1-32b'].includes(m.id)).map(m => {
-                const rate = MODEL_RATES[m.id]
+              {modelList.map(m => {
+                const rate = MODEL_RATES[(m as any).id]
                 return (
-                <button
-                  key={m.id}
-                  onClick={() => { setModel(m.id); setShowModelMenu(false) }}
-                  className="w-full flex items-center gap-2 px-3 py-2 hover:bg-[var(--c-border)] text-left"
-                >
-                  <span style={{ color: C.cyan }}>{m.icon}</span>
-                  <div className="min-w-0">
-                    <div className="mono text-[11px] text-[var(--c-text)]">{m.name}</div>
-                    <div className="mono text-[10px] text-[var(--c-faint)]">
-                      {m.provider}{rate ? ` · $${rate.in}/$${rate.out}` : ''}
+                  <button
+                    key={m.id}
+                    onClick={() => { setModel(m.id); setShowModelMenu(false) }}
+                    className="w-full flex items-center gap-2 px-3 py-2 hover:bg-[var(--c-border)] text-left"
+                  >
+                    <span style={{ color: C.cyan }}>{(m as any).icon ?? '⬡'}</span>
+                    <div className="min-w-0">
+                      <div className="mono text-[11px] text-[var(--c-text)]">{m.name}</div>
+                      <div className="mono text-[10px] text-[var(--c-faint)]">
+                        {(m as any).provider ?? 'Ollama'}{rate ? ` · $${rate.in}/$${rate.out}` : ''}
+                      </div>
                     </div>
-                  </div>
-                  {m.id === model && <span className="ml-auto text-[var(--c-cyan)] text-xs">✓</span>}
-                </button>
+                    {m.id === model && <span className="ml-auto text-[var(--c-cyan)] text-xs">✓</span>}
+                  </button>
                 )
               })}
-              {/* Open-weight token-optimised */}
-              <div className="mono text-[9px] text-[var(--c-dim)] uppercase tracking-widest px-3 pt-1 pb-0.5" style={{ borderTop: `1px solid ${C.border}` }}>
-                Open-weight · token-optimised
-              </div>
-              {LLM_MODELS.filter(m => ['qwen3-235b','qwen3-32b','kimi-k2','glm-4-32b','glm-z1-32b'].includes(m.id)).map(m => {
-                const rate = MODEL_RATES[m.id]
-                return (
-                <button
-                  key={m.id}
-                  onClick={() => { setModel(m.id); setShowModelMenu(false) }}
-                  className="w-full flex items-center gap-2 px-3 py-2 hover:bg-[var(--c-border)] text-left"
-                >
-                  <span style={{ color: C.cyan }}>{m.icon}</span>
-                  <div className="min-w-0">
-                    <div className="mono text-[11px] text-[var(--c-text)]">{m.name}</div>
-                    <div className="mono text-[10px] text-[var(--c-faint)]">
-                      {m.provider}{rate ? ` · $${rate.in}/$${rate.out}` : ''}
-                    </div>
-                  </div>
-                  {m.id === model && <span className="ml-auto text-[var(--c-cyan)] text-xs">✓</span>}
-                </button>
-                )
-              })}
-              <div className="mono text-[10px] text-[var(--c-faint)] px-3 py-2 border-t" style={{ borderColor: C.border }}>
-                Retrieval phases are pinned to {FAST_MODEL.name} regardless of this choice.
-              </div>
+              {(!source || source === 'demo') && (
+                <div className="mono text-[10px] text-[var(--c-faint)] px-3 py-2 border-t" style={{ borderColor: C.border }}>
+                  Retrieval phases are pinned to {FAST_MODEL.name} regardless of this choice.
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -3011,8 +3073,8 @@ function AgentSection({ model, setModel, domain, setDomain }: {
         })}
       </div>
 
-      {/* Ruled out — negative evidence, shown by default */}
-      {steps.length >= 3 && (
+      {/* Ruled out — demo mode only; real mode doesn't generate a ruled-out list yet */}
+      {steps.length >= 3 && (!source || source === 'demo') && (
         <div className="card p-4">
           <SectionHeader title="Ruled Out" sub="what the agent eliminated, and on what evidence" />
           <div className="flex flex-col gap-2">
@@ -3031,62 +3093,31 @@ function AgentSection({ model, setModel, domain, setDomain }: {
         </div>
       )}
 
-      {/* Verdict */}
-      {complete && gate !== 'rejected' && (
+      {/* Verdict — populated from real RCA response */}
+      {complete && gate !== 'rejected' && rcaDone && (
         <div className="card p-4" style={{ border: `1px solid ${a(C.green, 0.2)}`, background: a(C.green, 0.03) }}>
           <div className="mono text-[11px] text-[var(--c-green)] uppercase tracking-widest mb-3">
-            ✓ Analysis complete · {currentModel.name} · ${totals.cost.toFixed(3)} · {citationCount} citations · approved by operator
+            ✓ Analysis complete · {currentModel.name} · {citationCount} citations · approved by operator
+          </div>
+          <div className="mono text-[11px] text-[var(--c-text2)] mb-3 p-2 rounded" style={{ background: a(C.cyan, 0.04), border: `1px solid ${a(C.cyan, 0.12)}` }}>
+            {rcaDone.root_cause} ({((rcaDone.confidence ?? 0) * 100).toFixed(0)}% confidence)
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {[
-              { pri: 'P0', action: 'Rollback payment-svc → v2.13.9', eta: 'executing · ~10 min recovery', color: C.red },
-              { pri: 'P1', action: 'Fix release() at payment/process.ts:482', eta: 'ticket MPS-4471 · within 2h', color: C.amber },
-              { pri: 'P1', action: 'Add circuit breaker on PIS journey-api → MPS auth', eta: 'ticket PIS-2210 · this sprint', color: C.amber },
-            ].map(({ pri, action, eta, color }) => (
-              <div key={action} className="p-3 rounded" style={{ background: C.bg, border: `1px solid ${color}30` }}>
-                <div className="mono text-[10px] font-bold mb-1" style={{ color }}>{pri}</div>
-                <div className="mono text-[11px] text-[var(--c-text2)] mb-1">{action}</div>
-                <div className="mono text-[10px] text-[var(--c-faint)]">{eta}</div>
-              </div>
-            ))}
+            {(rcaDone.actions ?? []).slice(0, 3).map((action, i) => {
+              const col = i === 0 ? C.red : C.amber
+              return (
+                <div key={i} className="p-3 rounded" style={{ background: C.bg, border: `1px solid ${col}30` }}>
+                  <div className="mono text-[10px] font-bold mb-1" style={{ color: col }}>{i === 0 ? 'P0' : 'P1'}</div>
+                  <div className="mono text-[11px] text-[var(--c-text2)]">{action}</div>
+                </div>
+              )
+            })}
           </div>
         </div>
       )}
 
-      {/* Audit trail */}
-      <div className="card p-4">
-        <SectionHeader title="Run Audit Trail" sub="every run replayable — same evidence, same prompt, same verdict" />
-        <table className="w-full text-[11px] mono">
-          <thead>
-            <tr className="text-[var(--c-faint)] text-[10px] uppercase tracking-widest border-b border-[var(--c-border)]">
-              <th className="text-left pb-2 font-medium">Run</th>
-              <th className="text-left pb-2 font-medium">Tenant</th>
-              <th className="text-left pb-2 font-medium">Model</th>
-              <th className="text-left pb-2 font-medium">Verdict</th>
-              <th className="text-right pb-2 font-medium">Cost</th>
-              <th className="text-right pb-2 font-medium">MTTR</th>
-              <th className="text-right pb-2 font-medium">Decision</th>
-            </tr>
-          </thead>
-          <tbody>
-            {AGENT_RUNS.map(r => (
-              <tr key={r.id} className="border-b border-[var(--c-row)] hover:bg-[var(--c-row)]">
-                <td className="py-2 text-[var(--c-cyan)]">{r.id}<span className="text-[var(--c-faint)]"> · {r.when}</span></td>
-                <td className="py-2">
-                  <span className="mono text-[9px] px-1 rounded" style={{ background: a(domainColor(r.tenant as DomainId), 0.14), color: domainColor(r.tenant as DomainId) }}>
-                    {DOMAIN_BY_ID[r.tenant as DomainId].short}
-                  </span>
-                </td>
-                <td className="py-2 text-[var(--c-dim)]">{r.model}</td>
-                <td className="py-2 text-[var(--c-text2)]">{r.verdict}</td>
-                <td className="py-2 text-right text-[var(--c-dim)]">${r.cost.toFixed(2)}</td>
-                <td className="py-2 text-right text-[var(--c-dim)]">{r.mttr}</td>
-                <td className="py-2 text-right" style={{ color: r.decision === 'approved' ? C.green : C.red }}>{r.decision}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {/* Audit trail — real runs from Postgres when Elastic, demo rows otherwise */}
+      <AuditTrail source={source} />
     </div>
   )
 }
@@ -3863,7 +3894,7 @@ function TeamsSection({ logs, domain, setDomain, esServices }: {
                           return (
                             <span key={dep} className="mono text-[9px] px-1 rounded"
                               style={{ background: a(dc, 0.1), color: dc, border: `1px solid ${a(dc, cross ? 0.3 : 0.15)}` }}>
-                              → {name}{cross ? ` (${DOMAIN_BY_ID[dm as DomainId].short})` : ''}
+                              → {name}{cross ? ` (${DOMAIN_BY_ID[dm as DomainId]?.short ?? dm})` : ''}
                             </span>
                           )
                         })}
@@ -4318,28 +4349,53 @@ function CustomAgentRunner({ ag, domain, onClose }: { ag: CustomAgentDef; domain
   const modelInfo = LLM_MODELS.find(m => m.id === ag.model) || LLM_MODELS[0]
   const STEPS = useMemo(() => buildCustomAgentSteps(ag, tenant.label), [ag, tenant.label])
 
-  const startRun = useCallback(() => {
+  const startRun = useCallback(async () => {
     setRunning(true); setSteps([]); setStreamText(''); setDone(false)
-    let idx = 0
-    const next = () => {
-      if (idx >= STEPS.length) { setRunning(false); setDone(true); return }
-      const step = STEPS[idx]
-      setSteps(prev => [...prev, { ...step, status: 'running' }])
-      setStreamText('')
-      let ci = 0
-      const iv = setInterval(() => {
-        ci += 3
-        setStreamText(step.content.slice(0, ci))
-        if (ci >= step.content.length) {
-          clearInterval(iv)
-          setSteps(prev => prev.map(s => s.id === step.id ? { ...s, status: 'done', content: step.content } : s))
-          idx++
-          setTimeout(next, 400)
+    try {
+      const res = await fetch(`/agent/run/${ag.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain, date_from: new Date(Date.now() - 86400000).toISOString() }),
+      })
+      if (!res.ok) throw new Error(`Run ${res.status}`)
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done: streamDone, value } = await reader.read()
+        if (streamDone) break
+        for (const line of decoder.decode(value).split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6).trim()
+          if (payload === '[DONE]') break
+          try {
+            const parsed = JSON.parse(payload)
+            if (parsed.step) {
+              const s = parsed.step
+              const agentStep: AgentStep = {
+                id: s.id, phase: s.phase, tool: s.tool ?? s.phase,
+                content: s.content, status: s.status ?? 'done',
+                routed: s.routed ?? 'fast',
+                tokensIn: s.tokensIn ?? 0, tokensOut: s.tokensOut ?? 0,
+                latency: s.latency ?? 0, confidence: s.confidence,
+                citations: s.citations ?? [],
+              }
+              if (s.status === 'running') {
+                setSteps(prev => [...prev, agentStep])
+              } else {
+                setSteps(prev => {
+                  const exists = prev.find(x => x.id === s.id)
+                  return exists ? prev.map(x => x.id === s.id ? agentStep : x) : [...prev, agentStep]
+                })
+              }
+            }
+            if (parsed.done) { setDone(true) }
+          } catch {}
         }
-      }, 10)
-    }
-    next()
-  }, [STEPS])
+      }
+    } catch {}
+    setRunning(false)
+    setDone(true)
+  }, [ag.id, domain])
 
   const totals = steps.reduce((a, s) => ({
     tin: a.tin + s.tokensIn, tout: a.tout + s.tokensOut,
@@ -4647,7 +4703,20 @@ function CustomAgentSection({ domain, onAgentCreated }: {
 
 // ─── AI Agent Monitor ─────────────────────────────────────────────────────────
 
-function AIMonitorSection({ metrics }: { metrics: AgentMetric[] }) {
+function AIMonitorSection({ metrics: sessionMetrics }: { metrics: AgentMetric[] }) {
+  const [historicalMetrics, setHistoricalMetrics] = useState<AgentMetric[]>([])
+
+  // Load cross-session metrics from Postgres on mount; merge with current session.
+  useEffect(() => {
+    fetch('/agent/metrics?limit=500')
+      .then(r => r.json())
+      .then((rows: AgentMetric[]) => setHistoricalMetrics(Array.isArray(rows) ? rows : []))
+      .catch(() => {})
+  }, [])
+
+  // Session metrics take precedence for metrics already in the current session.
+  const sessionIds = new Set(sessionMetrics.map(m => m.id))
+  const metrics = [...sessionMetrics, ...historicalMetrics.filter(m => !sessionIds.has(m.id))]
   const totalTokens = metrics.reduce((n, m) => n + m.inputTokens + m.outputTokens, 0)
   const avgLatencyMs = metrics.length ? Math.round(metrics.reduce((n, m) => n + m.latencyMs, 0) / metrics.length) : 0
   const avgTokSec = metrics.length ? Number((metrics.reduce((n, m) => n + m.tokPerSec, 0) / metrics.length).toFixed(1)) : 0
@@ -4820,9 +4889,40 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: string; badge?: string }
   { id: 'aimonitor', label: 'AI Monitor', icon: '◉' },
 ]
 
+// ─── Error boundary — surfaces render crashes instead of showing a blank page ──
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props)
+    this.state = { error: null }
+  }
+  static getDerivedStateFromError(error: Error) { return { error } }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[LogSense crash]', error, info.componentStack)
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 32, fontFamily: 'monospace', fontSize: 13, color: '#ff4444', background: '#080c14', height: '100vh' }}>
+          <div style={{ marginBottom: 8, color: '#e0e6f0', fontSize: 16 }}>⚠ Render error — check browser console</div>
+          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: '#ff6b35' }}>{this.state.error.message}</pre>
+          <pre style={{ marginTop: 16, color: '#4a5568', fontSize: 11 }}>{this.state.error.stack}</pre>
+          <button
+            style={{ marginTop: 24, padding: '8px 16px', background: '#1a2535', color: '#00d4ff', border: '1px solid #1a2535', borderRadius: 4, cursor: 'pointer', fontFamily: 'monospace' }}
+            onClick={() => this.setState({ error: null })}
+          >
+            Dismiss and retry
+          </button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
-export default function App() {
+function AppInner() {
   const [section, setSection] = useState<NavSection>('lob')
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS)
   const [live, setLive] = useState(true)
@@ -4878,6 +4978,11 @@ export default function App() {
   const esDomains = useMemo(() => elasticDomains(es.services), [es.services])
   setTenantRegistry(source === 'elastic' ? esDomains : DEMO_DOMAINS)
 
+  // If the selected domain isn't in the new registry (e.g. 'pis' in Elastic mode which
+  // only has mps/mrd), clamp to the first valid domain for THIS render cycle so nothing
+  // crashes. The useEffect below then persists the reset via setDomain.
+  const safeDomain: DomainFilter = (DOMAIN_BY_ID[domain] ? domain : DOMAINS[0]?.id ?? 'mps') as DomainFilter
+
   // A tenant from the other registry cannot stay selected across a source swap.
   useEffect(() => {
     if (!DOMAINS.some(d => d.id === domain)) setDomain(DOMAINS[0]?.id ?? 'mps')
@@ -4920,8 +5025,8 @@ export default function App() {
 
   const currentModel = LLM_MODELS.find(m => m.id === model) || LLM_MODELS[0]
   const activeLogs = source === 'elastic' ? es.logs : logs
-  const activeData = useActiveData(source, domain, es)
-  const visibleLogs = activeLogs.filter(l => l.domain === domain)
+  const activeData = useActiveData(source, safeDomain, es)
+  const visibleLogs = activeLogs.filter(l => l.domain === safeDomain)
 
   /** Reshape per-tenant Elastic histograms into the stacked-area row format. */
   const esVolume = useMemo(() => {
@@ -5089,7 +5194,7 @@ export default function App() {
           style={{ borderBottom: `1px solid ${C.border}`, background: C.bg }}>
           <span className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest flex-shrink-0">LoB</span>
           {DOMAINS.map(d => {
-            const on = domain === d.id
+            const on = safeDomain === d.id
             const col = domainColor(d.id)
             return (
               <button
@@ -5144,15 +5249,15 @@ export default function App() {
           })()}
           <div className="flex-1 min-h-0 overflow-hidden">
           {section === 'lob' && (
-            <LobSection logs={activeLogs} domain={domain} setDomain={setDomain} data={activeData} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
+            <LobSection logs={activeLogs} domain={safeDomain} setDomain={setDomain} data={activeData} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
           )}
-          {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={domain} />}
-          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={domain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
-          {section === 'anomalies' && <AnomalySection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
-          {section === 'sla' && <SLASection domain={domain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
-          {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={domain} setDomain={setDomain} />}
-          {section === 'agent' && <CustomAgentSection domain={domain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
-          {section === 'pipeline' && <PipelineSection domain={domain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={safeDomain} />}
+          {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'anomalies' && <AnomalySection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
+          {section === 'sla' && <SLASection domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
+          {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} />}
+          {section === 'agent' && <CustomAgentSection domain={safeDomain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
+          {section === 'pipeline' && <PipelineSection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'aimonitor' && <AIMonitorSection metrics={agentMetrics} />}
           </div>
         </main>
@@ -5162,7 +5267,7 @@ export default function App() {
         open={askOpen}
         onClose={() => setAskOpen(false)}
         logs={visibleLogs}
-        domain={domain}
+        domain={safeDomain}
         model={model}
         setModel={setModel}
         wide={askWide}
@@ -5172,5 +5277,13 @@ export default function App() {
         onMetric={m => setAgentMetrics(prev => [...prev.slice(-499), m])}
       />
     </div>
+  )
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
   )
 }

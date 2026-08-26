@@ -179,7 +179,7 @@ function timeFilter(q: StreamQuery) {
 
 function buildQuery(q: StreamQuery) {
   const filter: any[] = [timeFilter(q)]
-  if (q.service) filter.push({ term: { [`${FIELDS.service}.keyword`]: q.service } })
+  if (q.service) filter.push({ term: { [FIELDS.service]: q.service } })
   if (q.severities?.length) {
     // Match however the shipper cased it.
     filter.push({
@@ -301,7 +301,7 @@ export async function fetchServices(
     query: { bool: { filter: [{ range: { [FIELDS.timestamp]: { gte: `now-${hours}h` } } }] } },
     aggs: {
       by_service: {
-        terms: { field: `${FIELDS.service}.keyword`, size: 50, order: { _count: 'desc' } },
+        terms: { field: FIELDS.service, size: 50, order: { _count: 'desc' } },
         aggs: {
           errors: {
             filter: {
@@ -350,7 +350,7 @@ export async function fetchErrorTypes(
   const byType = await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, {
     size: 0,
     query: errorFilter,
-    aggs: { by_type: { terms: { field: `${FIELDS.errorType}.keyword`, size: 7, missing: 'Uncategorised' } } },
+    aggs: { by_type: { terms: { field: FIELDS.errorType, size: 7, missing: 'Uncategorised' } } },
   }, signal)
 
   const typeBuckets: any[] = byType.aggregations?.by_type?.buckets ?? []
@@ -361,7 +361,7 @@ export async function fetchErrorTypes(
     ? ((await esFetch(`/${encodeURIComponent(tenant.index)}/_search`, {
         size: 0,
         query: errorFilter,
-        aggs: { by_type: { terms: { field: `${FIELDS.service}.keyword`, size: 7 } } },
+        aggs: { by_type: { terms: { field: FIELDS.service, size: 7 } } },
       }, signal)).aggregations?.by_type?.buckets ?? [])
     : typeBuckets
 
