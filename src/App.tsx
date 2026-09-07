@@ -2947,15 +2947,24 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
         ))}
       </div>
 
-      {/* Run telemetry */}
+      {/* Run telemetry — token counts only meaningful in demo mode; Elastic shows latency */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        {[
-          { label: 'Input tokens', value: totals.tin.toLocaleString(), sub: 'gen_ai.usage.input_tokens', color: C.cyan },
-          { label: 'Output tokens', value: totals.tout.toLocaleString(), sub: 'gen_ai.usage.output_tokens', color: C.cyan },
-          { label: 'Run cost', value: `$${totals.cost.toFixed(3)}`, sub: `${((totals.cost / budget) * 100).toFixed(0)}% of cap`, color: totals.cost > budget ? C.red : C.green },
-          { label: 'Wall time', value: `${totals.secs.toFixed(1)}s`, sub: 'agent span duration', color: C.dim },
-          { label: 'Citations', value: String(citationCount), sub: '0 uncited claims', color: C.purple },
-        ].map(t => (
+        {(source && source !== 'demo'
+          ? [
+              { label: 'Phases done', value: String(steps.filter(s => s.status === 'done').length), sub: `of ${steps.length} total`, color: C.cyan },
+              { label: 'Wall time', value: totals.secs > 0 ? `${totals.secs.toFixed(1)}s` : '0.0s', sub: 'real agent span', color: C.dim },
+              { label: 'Run cost', value: '$0.000', sub: 'on-prem model', color: C.green },
+              { label: 'Citations', value: String(citationCount), sub: 'evidence refs', color: C.purple },
+              { label: 'Status', value: running ? 'running' : gate === 'awaiting' ? 'awaiting' : complete ? 'complete' : 'ready', sub: 'agent state', color: running ? C.amber : complete ? C.green : C.dim },
+            ]
+          : [
+              { label: 'Input tokens', value: totals.tin.toLocaleString(), sub: 'gen_ai.usage.input_tokens', color: C.cyan },
+              { label: 'Output tokens', value: totals.tout.toLocaleString(), sub: 'gen_ai.usage.output_tokens', color: C.cyan },
+              { label: 'Run cost', value: `$${totals.cost.toFixed(3)}`, sub: `${((totals.cost / budget) * 100).toFixed(0)}% of cap`, color: totals.cost > budget ? C.red : C.green },
+              { label: 'Wall time', value: `${totals.secs.toFixed(1)}s`, sub: 'agent span duration', color: C.dim },
+              { label: 'Citations', value: String(citationCount), sub: '0 uncited claims', color: C.purple },
+            ]
+        ).map(t => (
           <div key={t.label} className="card p-3">
             <div className="text-[10px] text-[var(--c-dim)] uppercase tracking-widest">{t.label}</div>
             <div className="mono text-lg font-semibold" style={{ color: t.color }}>{t.value}</div>
@@ -2964,17 +2973,26 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
         ))}
       </div>
 
-      {/* Incident context */}
+      {/* Incident context — real data from investigation once available, demo placeholder before */}
       <div className="card p-4" style={{ border: `1px solid ${a(C.red, 0.2)}`, background: a(C.red, 0.03) }}>
         <div className="mono text-[10px] text-[var(--c-red)] uppercase tracking-widest mb-2">Active Incident Context</div>
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-          {[
-            { k: 'Incident', v: 'INC-2847' },
-            { k: 'Reported by', v: tenant.label },
-            { k: 'Started', v: '16:02 UTC' },
-            { k: 'Severity', v: 'P1 — Critical' },
-            { k: 'Impact', v: `41,900 ${tenant.impactUnit}` },
-          ].map(({ k, v }) => (
+          {(() => {
+            // Derive incident fields from real investigation data when available.
+            const scopeStep = steps.find(s => s.phase === 'Scope & Ground' && s.status === 'done')
+            const rcaStep = steps.find(s => s.phase === 'Root Cause' && s.status === 'done')
+            const isReal = source && source !== 'demo' && scopeStep
+            const topCitation = scopeStep?.citations?.[0] ?? ''
+            const startedAt = topCitation.length >= 10 ? topCitation.slice(0, 10) : '—'
+            const severity = rcaStep ? `${((rcaStep.confidence ?? 0.5) * 100).toFixed(0)}% confidence` : (isReal ? '—' : 'P1 — Critical')
+            return [
+              { k: 'Incident', v: isReal ? `RCA-${new Date().toISOString().slice(5, 10)}` : 'INC-2847' },
+              { k: 'Domain', v: tenant.label },
+              { k: 'Data range', v: isReal ? startedAt : '16:02 UTC' },
+              { k: 'Severity', v: severity },
+              { k: 'Top service', v: scopeStep?.citations?.[0]?.replace('service:', '') || (isReal ? '—' : `41,900 ${tenant.impactUnit}`) },
+            ]
+          })().map(({ k, v }) => (
             <div key={k}>
               <div className="mono text-[10px] text-[var(--c-faint)]">{k}</div>
               <div className="mono text-[12px] text-[var(--c-text)] font-medium">{v}</div>
@@ -4952,8 +4970,9 @@ function AppInner() {
     () => (typeof localStorage !== 'undefined' && (localStorage.getItem('logsense-theme') as ThemeMode)) || 'system'
   )
 
+  // Truncate to the day so floating-point date drift doesn't trigger spurious ES refreshes.
   const esSince = dateRange
-    ? new Date(dateRange.from).toISOString()
+    ? new Date(dateRange.from).toISOString().slice(0, 10) + 'T00:00:00.000Z'
     : 'now-24h'
   const esAggHours = dateRange
     ? Math.max(1, Math.ceil((dateRange.to.getTime() - dateRange.from.getTime()) / 3_600_000))

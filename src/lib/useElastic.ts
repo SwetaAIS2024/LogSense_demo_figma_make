@@ -21,6 +21,26 @@ export interface EsState {
   refresh: () => void
 }
 
+// ─── Aggregation cache ────────────────────────────────────────────────────────
+// Aggregated data (volume, services, errorTypes) survives panel navigation and
+// browser refresh via sessionStorage. Raw logs are too large to cache.
+
+function aggCacheKey(since: string, aggHours: number) {
+  // Round since to the nearest day so minor timestamp drift doesn't invalidate.
+  return `logsense-agg:${since.slice(0, 10)}:${aggHours}`
+}
+
+function loadAggCache(key: string): { volume: Record<string, VolumeBucket[]>; services: Record<string, ServiceRollup[]>; errorTypes: Record<string, ErrorTypeBucket[]> } | null {
+  try {
+    const raw = sessionStorage.getItem(key)
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
+}
+
+function saveAggCache(key: string, data: { volume: Record<string, VolumeBucket[]>; services: Record<string, ServiceRollup[]>; errorTypes: Record<string, ErrorTypeBucket[]> }) {
+  try { sessionStorage.setItem(key, JSON.stringify(data)) } catch {}
+}
+
 /** Bytes per LogEntry (strings are UTF-16 in V8, ~486 bytes average for MPS/MRD log shape). */
 const BYTES_PER_ENTRY = 500
 /** Hard ceiling for browsers without performance.memory (Firefox, Safari). */
@@ -55,12 +75,16 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
   /** Hours span used for aggregation queries (volume, services, error types). */
   aggHours?: number
 }): EsState {
+  const cacheKey = aggCacheKey(since, aggHours)
+  const cached = loadAggCache(cacheKey)
+
   const [status, setStatus] = useState<EsStatus>('off')
   const [error, setError] = useState<string | null>(null)
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [volume, setVolume] = useState<Record<string, VolumeBucket[]>>({})
-  const [services, setServices] = useState<Record<string, ServiceRollup[]>>({})
-  const [errorTypes, setErrorTypes] = useState<Record<string, ErrorTypeBucket[]>>({})
+  // Restore aggregated data from sessionStorage so panels show data immediately after refresh.
+  const [volume, setVolume] = useState<Record<string, VolumeBucket[]>>(cached?.volume ?? {})
+  const [services, setServices] = useState<Record<string, ServiceRollup[]>>(cached?.services ?? {})
+  const [errorTypes, setErrorTypes] = useState<Record<string, ErrorTypeBucket[]>>(cached?.errorTypes ?? {})
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
   const [lastPoll, setLastPoll] = useState<string | null>(null)
   const [docsSeen, setDocsSeen] = useState(0)
@@ -128,7 +152,15 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
 
             if (flushTimer) clearTimeout(flushTimer)
             flush()
-            return { t, fresh: [], vol: null, svc: null, errs: null }
+
+            // Fetch aggregations right after the initial full load so the LoB
+            // panel shows data immediately instead of waiting for the 6th poll.
+            const [vol0, svc0, errs0] = await Promise.all([
+              fetchVolume(t, aggHours, ctrl.signal).catch(() => null),
+              fetchServices(t, aggHours, ctrl.signal).catch(() => null),
+              fetchErrorTypes(t, aggHours, ctrl.signal).catch(() => null),
+            ])
+            return { t, fresh: [], vol: vol0, svc: svc0, errs: errs0 }
           }
           const fresh = await searchLogs(t, { after: cursors.current[t.id], since, size: 1000 }, ctrl.signal)
           if (fresh.length) cursors.current[t.id] = fresh[0].timestamp
@@ -157,11 +189,17 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
           setDocsSeen(allLogs.current.length)
         }
 
+        let newVol = volume
+        let newSvc = services
+        let newErrs = errorTypes
         for (const r of results) {
-          if (r.vol) setVolume(v => ({ ...v, [r.t.id]: r.vol! }))
-          if (r.svc) setServices(s => ({ ...s, [r.t.id]: r.svc! }))
-          if (r.errs) setErrorTypes(e => ({ ...e, [r.t.id]: r.errs! }))
+          if (r.vol) { newVol = { ...newVol, [r.t.id]: r.vol! }; setVolume(newVol) }
+          if (r.svc) { newSvc = { ...newSvc, [r.t.id]: r.svc! }; setServices(newSvc) }
+          if (r.errs) { newErrs = { ...newErrs, [r.t.id]: r.errs! }; setErrorTypes(newErrs) }
         }
+        // Persist aggregated data so the next session / browser refresh is instant.
+        const hasAggs = results.some(r => r.vol || r.svc || r.errs)
+        if (hasAggs) saveAggCache(cacheKey, { volume: newVol, services: newSvc, errorTypes: newErrs })
 
         pollCount.current++
         setLatencyMs(Math.round(performance.now() - t0))
