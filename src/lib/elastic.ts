@@ -23,8 +23,17 @@ export const ES_BASE = (env.VITE_ES_URL as string | undefined)?.replace(/\/$/, '
 /** Only set in direct-to-cluster mode; the proxy path leaves this empty. */
 const ES_API_KEY = (env.VITE_ES_API_KEY as string | undefined) || ''
 
-/** Elastic-backed tenants. Index patterns are overridable without a rebuild. */
-export const ES_TENANTS: { id: DomainId; index: string; label: string; team: string; short: string; icon: string }[] = [
+export interface EsTenant {
+  id: DomainId
+  index: string
+  label: string
+  team: string
+  short: string
+  icon: string
+}
+
+/** Curated tenants retained as fallbacks and metadata overrides. */
+export const ES_TENANTS: EsTenant[] = [
   {
     id: 'mps',
     index: (env.VITE_ES_INDEX_MPS as string | undefined) || 'logs-mps_parsed-offline',
@@ -38,6 +47,9 @@ export const ES_TENANTS: { id: DomainId; index: string; label: string; team: str
 ]
 
 export const ES_TENANT_IDS = ES_TENANTS.map(t => t.id)
+
+const tenantIndexOverrides = new Map<string, string>()
+const tenantNameOverrides = new Map<string, string>()
 
 /**
  * ECS field names. If your streams use a different shape, this object is the
@@ -84,11 +96,19 @@ export function setEsRuntimeConfig(cfg: { url: string; apiKey?: string; username
 }
 
 export function setEsTenantIndex(id: string, index: string) {
+  tenantIndexOverrides.set(id, index)
   const t = ES_TENANTS.find(t => t.id === id)
   if (t) t.index = index
 }
 
-async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
+/** Rename a discovered stream for display only; the tenant id stays stable. */
+export function setEsTenantName(id: string, label: string) {
+  const trimmed = label.trim()
+  if (trimmed) tenantNameOverrides.set(id, trimmed)
+  else tenantNameOverrides.delete(id)
+}
+
+async function esRequest(path: string, body?: unknown, signal?: AbortSignal) {
   const { url, apiKey, username, password } = esRuntimeConfig
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (apiKey) {
@@ -98,9 +118,9 @@ async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
   }
 
   const res = await fetch(`${url}${path}`, {
-    method: 'POST',
+    method: body === undefined ? 'GET' : 'POST',
     headers,
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   })
 
@@ -112,6 +132,60 @@ async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
     )
   }
   return res.json()
+}
+
+async function esFetch(path: string, body: unknown, signal?: AbortSignal) {
+  return esRequest(path, body, signal)
+}
+
+function shortLabel(label: string) {
+  return label.trim().split(/[\s_-]+/)[0]?.slice(0, 8).toUpperCase() || 'LOGS'
+}
+
+function autoTenant(name: string): EsTenant {
+  const id = name.replace(/^logs-/, '').replace(/[^a-zA-Z0-9_-]+/g, '-').toLowerCase()
+  const words = id.split(/[-_]+/).filter(Boolean)
+  const label = words.map(word => word.toUpperCase()).join(' ') || name
+  return {
+    id,
+    index: tenantIndexOverrides.get(id) ?? name,
+    label,
+    short: shortLabel(label),
+    team: `${label} logs`,
+    icon: '◇',
+  }
+}
+
+function discoveredTenant(name: string): EsTenant {
+  const configured = ES_TENANTS.find(tenant => tenant.index === name)
+  const base = configured
+    ? { ...configured, index: tenantIndexOverrides.get(configured.id) ?? configured.index }
+    : autoTenant(name)
+
+  // A user-supplied name is used verbatim everywhere, including the short badge.
+  const custom = tenantNameOverrides.get(base.id)?.trim()
+  return custom ? { ...base, label: custom, short: custom, team: custom } : base
+}
+
+/** Discover user data streams while preserving curated metadata for known tenants. */
+export async function discoverElasticTenants(signal?: AbortSignal): Promise<EsTenant[]> {
+  const json = await esRequest('/_resolve/index/logs-*?expand_wildcards=open', undefined, signal)
+  const internalPrefixes = ['logs-elastic_agent-', 'logs-elastic_agent.', 'logs-system.']
+  const names = new Set<string>(
+    (json.data_streams ?? [])
+      .map((stream: { name?: unknown }) => String(stream.name ?? ''))
+      .filter((name: string) =>
+        name.startsWith('logs-') &&
+        !name.startsWith('logs-.') &&
+        !internalPrefixes.some(prefix => name.startsWith(prefix)),
+      ),
+  )
+
+  for (const index of tenantIndexOverrides.values()) names.add(index)
+
+  return [...names]
+    .sort((left, right) => left.localeCompare(right))
+    .map(discoveredTenant)
 }
 
 // ─── Mapping ──────────────────────────────────────────────────────────────────

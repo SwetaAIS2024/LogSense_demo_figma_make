@@ -135,8 +135,42 @@ body {
   100% { stroke-dashoffset: 0; }
 }
 
+@keyframes gate-ring {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-amber) 34%, transparent); }
+  70% { box-shadow: 0 0 0 10px color-mix(in srgb, var(--c-amber) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-amber) 0%, transparent); }
+}
+
+@keyframes sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
 .animate-pulse-dot {
   animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+.gate-ring {
+  animation: gate-ring 2.2s ease-out infinite;
+}
+
+/* Left-to-right shimmer over an action card while its change is being applied. */
+.applying-sweep {
+  position: relative;
+  overflow: hidden;
+}
+
+.applying-sweep::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--c-cyan) 16%, transparent), transparent);
+  animation: sweep 1.3s linear infinite;
+}
+
+.focus-transition {
+  transition: opacity 0.35s ease, filter 0.35s ease;
 }
 
 .animate-slide-in {

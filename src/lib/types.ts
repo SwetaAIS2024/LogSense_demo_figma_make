@@ -2,8 +2,9 @@
 
 export type Severity = 'CRITICAL' | 'ERROR' | 'WARN' | 'INFO' | 'DEBUG'
 
-/** Four LoB domains. */
-export type DomainId = 'mps' | 'mrd' | 'pis' | 'ssa'
+/** Known LoB domains plus tenant IDs discovered from Elasticsearch at runtime. */
+export type KnownDomainId = 'mps' | 'mrd' | 'pis' | 'ssa'
+export type DomainId = KnownDomainId | (string & {})
 export type DomainFilter = DomainId
 
 export interface LogEntry {

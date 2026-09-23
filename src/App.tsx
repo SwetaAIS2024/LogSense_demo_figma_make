@@ -5,8 +5,8 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ScatterChart,
   Scatter, ReferenceLine, Legend
 } from 'recharts'
-import type { DomainDef, DomainFilter, DomainId, LogEntry, Severity } from '@/lib/types'
-import { ES_BASE, ES_TENANTS, setEsRuntimeConfig, setEsTenantIndex, type ServiceRollup, type VolumeBucket, type ErrorTypeBucket } from '@/lib/elastic'
+import type { DomainDef, DomainFilter, DomainId, KnownDomainId, LogEntry, Severity } from '@/lib/types'
+import { ES_BASE, setEsRuntimeConfig, setEsTenantIndex, setEsTenantName, type EsTenant, type ServiceRollup, type VolumeBucket, type ErrorTypeBucket } from '@/lib/elastic'
 import { useElasticStream, type EsState } from '@/lib/useElastic'
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -74,6 +74,34 @@ function usePrefersDark() {
     return () => mq.removeEventListener('change', on)
   }, [])
   return dark
+}
+
+function useMediaQuery(query: string) {
+  const [match, setMatch] = useState(() =>
+    typeof window === 'undefined' ? false : window.matchMedia(query).matches
+  )
+  useEffect(() => {
+    const mq = window.matchMedia(query)
+    const on = (e: MediaQueryListEvent) => setMatch(e.matches)
+    setMatch(mq.matches)
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
+  }, [query])
+  return match
+}
+
+/** Reads a persisted UI preference, falling back when storage is unavailable. */
+function loadPref<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw === null ? fallback : (JSON.parse(raw) as T)
+  } catch {
+    return fallback
+  }
+}
+
+function savePref(key: string, value: unknown) {
+  try { localStorage.setItem(key, JSON.stringify(value)) } catch {}
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -292,14 +320,14 @@ const ES_TENANT_DEFAULTS: Record<string, Pick<DomainDef, 'impactUnit' | 'slo' | 
 const EMPTY_MESSAGES: Record<Severity, string[]> = { CRITICAL: [], ERROR: [], WARN: [], INFO: [], DEBUG: [] }
 
 /** Build tenant definitions for Elastic mode, folding in discovered services. */
-function elasticDomains(discovered: Record<string, { service: string }[]>): DomainDef[] {
-  return ES_TENANTS.map(t => ({
+function elasticDomains(tenants: EsTenant[], discovered: Record<string, { service: string }[]>): DomainDef[] {
+  return tenants.map(t => ({
     id: t.id,
     label: t.label,
     short: t.short,
     team: t.team,
     icon: t.icon,
-    share: 1 / ES_TENANTS.length,
+    share: tenants.length ? 1 / tenants.length : 0,
     impactUnit: ES_TENANT_DEFAULTS[t.id]?.impactUnit ?? 'requests',
     services: (discovered[t.id] ?? []).map(s => s.service),
     messages: EMPTY_MESSAGES,
@@ -393,7 +421,7 @@ const VOLUME_DATA = Array.from({ length: 24 }, (_, i) => {
 })
 
 /** Error taxonomy differs per LoB. */
-const ERROR_DIST_BY_DOMAIN: Record<DomainFilter, { name: string; count: number; pct: number }[]> = {
+const ERROR_DIST_BY_DOMAIN: Record<KnownDomainId, { name: string; count: number; pct: number }[]> = {
   mps: [
     { name: 'AcquirerTimeout', count: 1842, pct: 34.2 },
     { name: 'PoolExhausted', count: 1124, pct: 20.9 },
@@ -592,7 +620,7 @@ const ES_TEAM_PROFILE = (team: string): TeamProfile => ({
   risks: [],
 })
 
-const TEAM_PROFILES: Record<DomainId, TeamProfile> = {
+const TEAM_PROFILES: Record<KnownDomainId, TeamProfile> = {
   mps: {
     oncall: 'J. Marchetti · secondary R. Adeyemi',
     escalation: 'Payments duty lead → CTO if scheme cutoff at risk',
@@ -642,6 +670,12 @@ const UNKNOWN_SERVICE: ServiceMeta = {
   tier: 'core', runtime: 'unknown', version: '—', instances: 0, deps: [], squad: '—',
 }
 
+/** Discovered Elastic tenants have no hand-written profile, so derive a neutral one. */
+function teamProfile(id: DomainId): TeamProfile {
+  return TEAM_PROFILES[id as KnownDomainId]
+    ?? ES_TEAM_PROFILE(DOMAIN_BY_ID[id]?.team ?? String(id))
+}
+
 /**
  * Per-service operating numbers. Demo tenants use deterministic synthetic
  * values so a team's page is stable; Elastic tenants pass a live rollup, which
@@ -675,7 +709,7 @@ function useActiveData(source: DataSource, domain: DomainFilter, es: EsState): A
       case 'demo':
         return {
           source,
-          errorDist:   ERROR_DIST_BY_DOMAIN[domain],
+          errorDist:   ERROR_DIST_BY_DOMAIN[domain as KnownDomainId] ?? null,
           volume:      null, // sections generate synthetic volume for demo via seeded()
           services:    null, // LobSection uses serviceStats() from d.services in demo mode
           allVolume:   null,
@@ -1085,7 +1119,7 @@ function OverviewSection({ logs, domain, setDomain, volumeData, errorDist }: {
   const scope = [DOMAIN_BY_ID[domain]]
   const worstBurn = Math.max(...scope.map(d => d.slo.burn))
   const remoteDist = errorDist?.[domain]
-  const dist = remoteDist?.length ? remoteDist : ERROR_DIST_BY_DOMAIN[domain]
+  const dist = remoteDist?.length ? remoteDist : (ERROR_DIST_BY_DOMAIN[domain as KnownDomainId] ?? [])
   const volume = volumeData ?? VOLUME_DATA
 
   return (
@@ -2262,7 +2296,7 @@ function ChatResultTable({ table }: { table: ChatTable }) {
   )
 }
 
-function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide, source, dateRange, onMetric }: {
+function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide, source, dateRange, onMetric, rcaContext }: {
   open: boolean
   onClose: () => void
   logs: LogEntry[]
@@ -2274,6 +2308,7 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
   source?: DataSource
   dateRange?: DateRange
   onMetric?: (m: AgentMetric) => void
+  rcaContext?: RcaContext | null
 }) {
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
@@ -2320,6 +2355,7 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
           date_to: dateRange?.to.toISOString() ?? new Date().toISOString(),
           message: q,
           model,
+          rca_context: rcaContext ? formatRcaContext(rcaContext) : null,
         }),
       })
 
@@ -2366,7 +2402,9 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
       }
     } catch (err) {
       // Fall back to demo answers when the agent service is not running.
-      const answer = answerQuestion(q, logs, domain)
+      const answer = rcaContext?.actions.length && /remediat|rollback|action|approve|fix|mitigat/i.test(q)
+        ? { text: `Assessing the remediation currently proposed for ${rcaContext.scope}:\n\n${formatRcaContext(rcaContext)}\n\nThe P0 items are reversible and target the confirmed root cause, so they are safe to approve first; the P1 items are the durable fix and can follow through normal change control.` }
+        : answerQuestion(q, logs, domain)
       let i = 0
       await new Promise<void>(resolve => {
         const timer = setInterval(() => {
@@ -2383,7 +2421,7 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
 
     setMessages(prev => prev.map(m => m.id === agentId ? { ...m, streaming: false } : m))
     setBusy(false)
-  }, [logs, domain, source, dateRange, sessionId, busy, onMetric])
+  }, [logs, domain, source, dateRange, sessionId, busy, onMetric, rcaContext])
 
   if (!open) return null
 
@@ -2627,8 +2665,520 @@ const AGENT_RUNS = [
   { id: 'run_5c88fe', when: 'Yesterday', tenant: 'mps', model: 'Claude Sonnet 5', cost: 0.29, verdict: 'Expired mTLS cert on tokenisation-svc', decision: 'approved', mttr: '22m' },
 ]
 
-// ─── Audit Trail ─────────────────────────────────────────────────────────────
+// ─── Remediation ─────────────────────────────────────────────────────────────
+// The gate is the only point in the run where the system asks to change prod, so
+// it gets its own console rather than a line buried in the scrolling step log.
 
+type ActionStatus = 'proposed' | 'queued' | 'applying' | 'verified' | 'skipped' | 'rejected'
+
+type RemediationAction = {
+  id: string
+  priority: 'P0' | 'P1' | 'P2'
+  title: string
+  eta: string
+  risk: 'low' | 'medium' | 'high'
+  reversible: boolean
+  blast: string[]
+  runbook: string
+  command: string
+  status: ActionStatus
+}
+
+/** What the RCA run knows, shared with the chat panel so it can reason about it. */
+type RcaContext = {
+  scope: string
+  gate: 'idle' | 'awaiting' | 'approved' | 'rejected'
+  rootCause?: string
+  confidence?: number
+  actions: RemediationAction[]
+}
+
+function formatRcaContext(ctx: RcaContext): string {
+  const lines = ctx.actions.map(x =>
+    `  ${x.priority} · ${x.title} — risk ${x.risk}, ${x.reversible ? 'reversible' : 'IRREVERSIBLE'}, ` +
+    `recovery ${x.eta}, affects ${x.blast.join('/')}, runbook ${x.runbook}, status ${x.status}`
+  ).join('\n')
+  return [
+    `Scope: ${ctx.scope}`,
+    `Decision state: ${ctx.gate}`,
+    ctx.rootCause ? `Root cause (${((ctx.confidence ?? 0) * 100).toFixed(0)}% confidence): ${ctx.rootCause}` : 'Root cause: not concluded yet',
+    ctx.actions.length ? `Proposed remediation actions:\n${lines}` : 'Proposed remediation actions: none yet',
+  ].join('\n')
+}
+
+/** Keyword → risk posture. Destructive verbs are checked before benign ones. */
+const RISK_RULES: { re: RegExp; risk: RemediationAction['risk']; reversible: boolean }[] = [
+  { re: /\b(drop|delete|truncate|purge|wipe|failover|reset)\b/i, risk: 'high', reversible: false },
+  { re: /\b(rollback|revert|restart|scale|raise|increase|cache|circuit ?breaker|throttle|drain)\b/i, risk: 'low', reversible: true },
+  { re: /\b(fix|patch|deploy|ship|release|migrate|rotate)\b/i, risk: 'medium', reversible: true },
+]
+
+const RISK_COLOR = { low: () => C.green, medium: () => C.amber, high: () => C.red }
+
+/**
+ * Turn the agent's proposal text (demo) or `actions[]` (backend) into structured
+ * actions that can be ranked, selected and executed one at a time.
+ */
+function parseActions(raw: string | string[], fallbackScope: string, citations?: string[]): RemediationAction[] {
+  const runbookCite = (citations ?? []).find(c => c.startsWith('runbook:'))?.slice(8)
+  const lines = (Array.isArray(raw) ? raw : raw.split('\n'))
+    .map(l => l.trim())
+    .filter(Boolean)
+    .filter(l => !/^(proposed|recommended|actions?)\b.*:$/i.test(l))
+
+  return lines.map((line, i) => {
+    const pm = line.match(/^P([0-2])\s*[·:.\-–—]?\s*/)
+    const priority = (pm ? `P${pm[1]}` : i === 0 ? 'P0' : 'P1') as RemediationAction['priority']
+    let title = pm ? line.slice(pm[0].length).trim() : line
+    const em = title.match(/\[(?:recovery\s*)?~?\s*([^\]]+)\]/i)
+    if (em) title = title.replace(em[0], '').trim()
+    const eta = em ? em[1].trim().replace(/^~/, '') : priority === 'P0' ? '10m' : '1h'
+    const rule = RISK_RULES.find(r => r.re.test(title))
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const blast = DOMAINS.filter(d =>
+      new RegExp(`\\b(${esc(d.short)}|${esc(d.id)})\\b`, 'i').test(title)
+    ).map(d => d.short)
+    const svc = title.match(/[a-z0-9]+(?:-[a-z0-9]+)*-(?:svc|api|db|adapter|service)/i)?.[0]
+    return {
+      id: `act-${i}`,
+      priority,
+      title,
+      eta: `~${eta}`,
+      risk: rule?.risk ?? 'medium',
+      reversible: rule?.reversible ?? true,
+      blast: blast.length ? blast : [fallbackScope],
+      runbook: runbookCite ?? `RB-${priority}-${(svc ?? fallbackScope).toUpperCase().slice(0, 6)}`,
+      command: `ops remediate --action ${i + 1} --target ${svc ?? fallbackScope.toLowerCase()} --confirm`,
+      status: 'proposed' as ActionStatus,
+    }
+  })
+}
+
+const ACTION_STATE: Record<ActionStatus, { label: string; col: () => string }> = {
+  proposed: { label: 'awaiting decision', col: () => C.faint },
+  queued: { label: 'queued', col: () => C.dim },
+  applying: { label: 'applying…', col: () => C.cyan },
+  verified: { label: 'verified', col: () => C.green },
+  skipped: { label: 'not selected', col: () => C.faint },
+  rejected: { label: 'rejected', col: () => C.red },
+}
+
+function RemediationActionCard({ action, selectable, selected, onToggle }: {
+  action: RemediationAction; selectable: boolean; selected: boolean; onToggle?: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const pcol = action.priority === 'P0' ? C.red : action.priority === 'P1' ? C.amber : C.cyan
+  const state = ACTION_STATE[action.status]
+  const scol = state.col()
+  const dim = action.status === 'skipped'
+
+  const copy = () => {
+    navigator.clipboard?.writeText(action.command).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1400)
+    }).catch(() => {})
+  }
+
+  return (
+    <div
+      onClick={selectable ? onToggle : undefined}
+      className={`rounded p-3 flex flex-col gap-2 focus-transition ${selectable ? 'cursor-pointer' : ''} ${action.status === 'applying' ? 'applying-sweep' : ''}`}
+      style={{
+        background: selected && selectable ? a(pcol, 0.07) : C.bg,
+        border: `1px solid ${selected && selectable ? a(pcol, 0.45) : a(pcol, 0.18)}`,
+        borderLeft: `3px solid ${action.status === 'verified' ? C.green : pcol}`,
+        opacity: dim ? 0.4 : 1,
+      }}
+    >
+      <div className="flex items-start gap-2.5">
+        {selectable && (
+          <span
+            className="mono text-[10px] w-4 h-4 rounded-sm flex items-center justify-center flex-shrink-0 mt-0.5"
+            style={{
+              background: selected ? a(pcol, 0.22) : 'transparent',
+              border: `1px solid ${selected ? pcol : C.border}`,
+              color: pcol,
+            }}
+          >
+            {selected ? '✓' : ''}
+          </span>
+        )}
+        <span
+          className="mono text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0"
+          style={{ background: a(pcol, 0.14), color: pcol, border: `1px solid ${a(pcol, 0.3)}` }}
+        >
+          {action.priority}
+        </span>
+        <span className="mono text-[11.5px] text-[var(--c-text2)] leading-snug flex-1 min-w-0">{action.title}</span>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 pl-1">
+        <span className="mono text-[9px] px-1.5 py-0.5 rounded"
+          style={{ background: a(RISK_COLOR[action.risk](), 0.1), color: RISK_COLOR[action.risk](), border: `1px solid ${a(RISK_COLOR[action.risk](), 0.22)}` }}>
+          {action.risk} risk
+        </span>
+        <span className="mono text-[9px] px-1.5 py-0.5 rounded"
+          style={{ background: a(action.reversible ? C.green : C.red, 0.08), color: action.reversible ? C.green : C.red }}>
+          {action.reversible ? '↺ reversible' : '⚠ irreversible'}
+        </span>
+        <span className="mono text-[9px] px-1.5 py-0.5 rounded" style={{ background: C.row, color: C.dim }}>
+          {action.eta} to recover
+        </span>
+        {action.blast.map(b => (
+          <span key={b} className="mono text-[9px] px-1.5 py-0.5 rounded"
+            style={{ background: a(C.purple, 0.1), color: C.purple }}>
+            {b}
+          </span>
+        ))}
+      </div>
+
+      <div className="flex items-center gap-3 pl-1 flex-wrap">
+        <span className="mono text-[9px]" style={{ color: scol }}>
+          {action.status === 'applying' && <span className="animate-pulse-dot">◈ </span>}
+          {action.status === 'verified' ? '✓ ' : ''}{state.label}
+        </span>
+        <button
+          onClick={e => { e.stopPropagation(); copy() }}
+          className="mono text-[9px] underline underline-offset-2"
+          style={{ color: C.faint }}
+          title={action.command}
+        >
+          {copied ? 'copied ✓' : 'copy command'}
+        </button>
+        <span className="mono text-[9px]" style={{ color: C.faint }}>runbook {action.runbook}</span>
+      </div>
+
+      {(action.status === 'applying' || action.status === 'verified') && (
+        <div className="h-0.5 rounded-full overflow-hidden" style={{ background: C.row }}>
+          <div
+            className="h-full focus-transition"
+            style={{
+              width: action.status === 'verified' ? '100%' : '55%',
+              background: action.status === 'verified' ? C.green : C.cyan,
+              transition: 'width 1.4s ease',
+            }}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RemediationConsole({ actions, gate, onApprove, onReject, scope, operator, recovery, executing, onCollapse }: {
+  actions: RemediationAction[]
+  gate: 'idle' | 'awaiting' | 'approved' | 'rejected'
+  onApprove: (ids: string[]) => void
+  onReject: (reason: string) => void
+  scope: string
+  operator: string
+  recovery: number
+  executing: boolean
+  onCollapse?: () => void
+}) {
+  const [sel, setSel] = useState<string[]>([])
+  const [left, setLeft] = useState(300)
+  const [rejecting, setRejecting] = useState(false)
+  const [reason, setReason] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+  const awaiting = gate === 'awaiting'
+  const ids = actions.map(x => x.id).join(',')
+
+  useEffect(() => { setSel(actions.map(x => x.id)) }, [ids])
+
+  useEffect(() => {
+    if (!awaiting) return
+    ref.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setLeft(300)
+    const iv = setInterval(() => setLeft(s => (s > 0 ? s - 1 : 0)), 1000)
+    return () => clearInterval(iv)
+  }, [awaiting])
+
+  useEffect(() => {
+    if (!awaiting || rejecting) return
+    const on = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null
+      if (el && /input|textarea|select/i.test(el.tagName)) return
+      if (e.key === 'a' || e.key === 'A') { e.preventDefault(); onApprove(sel) }
+      if (e.key === 'r' || e.key === 'R') { e.preventDefault(); setRejecting(true) }
+    }
+    window.addEventListener('keydown', on)
+    return () => window.removeEventListener('keydown', on)
+  }, [awaiting, rejecting, sel, onApprove])
+
+  const curve = useMemo(() => {
+    const decayed = Math.round(recovery * 16)
+    return Array.from({ length: 12 + decayed }, (_, i) => {
+      if (i < 12) return { t: i, v: 4.2 + Math.sin(i * 1.7) * 0.22 }
+      const k = (i - 11) / 16
+      return { t: i, v: Math.max(0.28, 4.2 * Math.pow(1 - k, 2.1)) }
+    })
+  }, [recovery])
+
+  const current = curve[curve.length - 1]?.v ?? 4.2
+  const verified = actions.filter(x => x.status === 'verified').length
+  const inPlay = actions.filter(x => x.status !== 'skipped' && x.status !== 'proposed').length
+  const settled = gate === 'approved' && !executing && recovery >= 1
+  const headCol = gate === 'rejected' ? C.red : settled ? C.green : awaiting ? C.amber : gate === 'idle' ? C.faint : C.cyan
+  const mm = String(Math.floor(left / 60)).padStart(2, '0')
+  const ss = String(left % 60).padStart(2, '0')
+
+  return (
+    <div
+      ref={ref}
+      className={`card overflow-hidden animate-fade-up ${awaiting ? 'gate-ring' : ''}`}
+      style={{ border: `1px solid ${a(headCol, 0.45)}`, background: a(headCol, 0.03) }}
+    >
+      {/* Banner */}
+      <div className="px-3.5 py-2.5 flex flex-col gap-1"
+        style={{ background: a(headCol, 0.1), borderBottom: `1px solid ${a(headCol, 0.25)}` }}>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="mono text-[11px] font-semibold uppercase tracking-widest" style={{ color: headCol }}>
+            {awaiting && <span className="animate-pulse-dot">⏸ </span>}
+            Remediation
+          </span>
+          {awaiting && (
+            <span className="mono text-[10px] px-2 py-0.5 rounded ml-auto"
+              style={{ background: a(left < 60 ? C.red : C.amber, 0.14), color: left < 60 ? C.red : C.amber }}>
+              {mm}:{ss}
+            </span>
+          )}
+          {onCollapse && (
+            <button onClick={onCollapse} title="Collapse panel"
+              className={`mono text-[12px] leading-none px-1.5 py-0.5 rounded ${awaiting ? '' : 'ml-auto'}`}
+              style={{ color: C.dim, border: `1px solid ${C.border}` }}>
+              »
+            </button>
+          )}
+        </div>
+        <span className="mono text-[10px] text-[var(--c-dim)] leading-snug">
+          {gate === 'idle' ? 'No proposals yet — run the agent to reach the remediation gate.'
+            : awaiting ? 'Agent paused — a production change needs a named human decision.'
+            : gate === 'rejected' ? 'Rejected — escalated to on-call, no change applied.'
+            : executing ? 'Applying approved changes…' : settled ? 'Changes applied and verified.' : 'Decision recorded.'}
+        </span>
+        <span className="mono text-[9px] text-[var(--c-faint)]">
+          scope {scope} · operator {operator}{awaiting ? ' · auto-escalates on timeout' : ''}
+        </span>
+      </div>
+
+      <div className="p-3.5 flex flex-col gap-3">
+        {actions.length === 0 ? (
+          <div className="rounded p-4 text-center" style={{ background: C.bg, border: `1px dashed ${C.border}` }}>
+            <div className="text-2xl mb-1" style={{ color: C.faint }}>⚇</div>
+            <div className="mono text-[10px] text-[var(--c-faint)] leading-relaxed">
+              Proposed actions appear here at phase 6.<br />Nothing touches production without approval.
+            </div>
+          </div>
+        ) : (
+        <div className="flex flex-col gap-2.5 overflow-y-auto pr-0.5" style={{ maxHeight: '48vh' }}>
+          {actions.map((action, i) => (
+            <div key={action.id} className="animate-fade-up" style={{ animationDelay: `${i * 70}ms`, animationFillMode: 'backwards' }}>
+              <RemediationActionCard
+                action={action}
+                selectable={awaiting}
+                selected={sel.includes(action.id)}
+                onToggle={() => setSel(s => (s.includes(action.id) ? s.filter(x => x !== action.id) : [...s, action.id]))}
+              />
+            </div>
+          ))}
+        </div>
+        )}
+
+        {/* Decision bar */}
+        {awaiting && !rejecting && (
+          <div className="flex flex-col gap-2 pt-3" style={{ borderTop: `1px solid ${C.border}` }}>
+            <div className="mono text-[10px] text-[var(--c-dim)]">
+              {sel.length} of {actions.length} selected ·{' '}
+              <button onClick={() => setSel(actions.map(x => x.id))} className="underline underline-offset-2">all</button>
+              {' · '}
+              <button onClick={() => setSel(actions.filter(x => x.priority === 'P0').map(x => x.id))} className="underline underline-offset-2">P0 only</button>
+            </div>
+            <button
+              onClick={() => onApprove(sel)}
+              disabled={!sel.length}
+              className="mono text-[11.5px] px-4 py-2 rounded font-semibold w-full"
+              style={{
+                background: a(C.green, sel.length ? 0.16 : 0.05),
+                border: `1px solid ${a(C.green, sel.length ? 0.5 : 0.15)}`,
+                color: C.green,
+                opacity: sel.length ? 1 : 0.5,
+              }}
+            >
+              Approve {sel.length} action{sel.length === 1 ? '' : 's'} ▸
+            </button>
+            <button
+              onClick={() => setRejecting(true)}
+              className="mono text-[11px] px-3 py-1.5 rounded w-full"
+              style={{ background: a(C.red, 0.1), border: `1px solid ${a(C.red, 0.3)}`, color: C.red }}
+            >
+              Reject &amp; escalate
+            </button>
+            <span className="mono text-[9px] text-[var(--c-faint)] text-center">A approve · R reject</span>
+          </div>
+        )}
+
+        {/* Reject requires a reason — that reason is what lands in the audit trail. */}
+        {awaiting && rejecting && (
+          <div className="flex flex-col gap-2 pt-3" style={{ borderTop: `1px solid ${C.border}` }}>
+            <div className="mono text-[10px] uppercase tracking-widest" style={{ color: C.red }}>Reason for rejection</div>
+            <input
+              autoFocus
+              value={reason}
+              onChange={e => setReason(e.target.value)}
+              placeholder="e.g. change freeze until 18:00 — escalate to MPS on-call"
+              className="mono text-[11px] px-3 py-2 rounded bg-transparent outline-none"
+              style={{ border: `1px solid ${a(C.red, 0.3)}`, color: C.text2 }}
+            />
+            <div className="flex gap-2">
+              <button onClick={() => { setRejecting(false); setReason('') }} className="mono text-[11px] px-3 py-1.5 rounded flex-1"
+                style={{ border: `1px solid ${C.border}`, color: C.dim }}>
+                Cancel
+              </button>
+              <button onClick={() => onReject(reason.trim() || 'No reason given')} className="mono text-[11px] px-3 py-1.5 rounded flex-1"
+                style={{ background: a(C.red, 0.12), border: `1px solid ${a(C.red, 0.35)}`, color: C.red }}>
+                Confirm rejection
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Recovery — the point of the whole run, shown as a curve bending back */}
+        {gate === 'approved' && (
+          <div className="rounded p-3 animate-fade-up" style={{ background: C.bg, border: `1px solid ${a(settled ? C.green : C.cyan, 0.25)}` }}>
+            <div className="flex items-baseline gap-2 flex-wrap mb-2">
+              <span className="mono text-[10px] uppercase tracking-widest" style={{ color: settled ? C.green : C.cyan }}>
+                Recovery
+              </span>
+              <span className="mono text-[9px] text-[var(--c-faint)]">{verified}/{inPlay} verified</span>
+              <span className="mono text-[12px] font-semibold ml-auto" style={{ color: settled ? C.green : C.amber }}>
+                4.2% → {current.toFixed(2)}%
+              </span>
+            </div>
+            <div style={{ height: 56 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={curve} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
+                  <defs>
+                    <linearGradient id="recoveryFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={settled ? C.green : C.cyan} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={settled ? C.green : C.cyan} stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <YAxis hide domain={[0, 5]} />
+                  <ReferenceLine y={0.5} stroke={C.green} strokeDasharray="2 3" strokeOpacity={0.5} />
+                  <Area type="monotone" dataKey="v" stroke={settled ? C.green : C.cyan} strokeWidth={1.6}
+                    fill="url(#recoveryFill)" isAnimationActive={false} dot={false} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            {settled && (
+              <div className="flex gap-4 flex-wrap mt-2 pt-2" style={{ borderTop: `1px solid ${C.border}` }}>
+                {[
+                  { k: 'MTTR saved', v: '41m', c: C.green },
+                  { k: 'Back within SLO', v: '02:14', c: C.green },
+                  { k: 'Approved by', v: operator, c: C.text2 },
+                ].map(({ k, v, c }) => (
+                  <div key={k}>
+                    <div className="mono text-[9px] text-[var(--c-faint)] uppercase tracking-widest">{k}</div>
+                    <div className="mono text-[12px] font-medium" style={{ color: c }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const RAIL = { min: 320, max: 760, def: 380, collapsed: 40 }
+
+/** Side rail with a drag handle and a collapsed strip; width/state persist per browser. */
+function ResizableRail({ open, setOpen, width, setWidth, accent, alert, label, children }: {
+  open: boolean
+  setOpen: (v: boolean) => void
+  width: number
+  setWidth: (w: number) => void
+  accent: string
+  alert: boolean
+  label: string
+  children: ReactNode
+}) {
+  const wide = useMediaQuery('(min-width: 1280px)')
+  const drag = useRef<{ x: number; w: number } | null>(null)
+  const [dragging, setDragging] = useState(false)
+
+  useEffect(() => {
+    const move = (e: PointerEvent) => {
+      if (!drag.current) return
+      setWidth(Math.min(RAIL.max, Math.max(RAIL.min, drag.current.w - (e.clientX - drag.current.x))))
+    }
+    const up = () => {
+      if (!drag.current) return
+      drag.current = null
+      setDragging(false)
+      document.body.style.userSelect = ''
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
+  }, [setWidth])
+
+  if (!wide) {
+    return (
+      <div className="w-full min-w-0">
+        {open ? children : (
+          <button onClick={() => setOpen(true)} className="card w-full px-3 py-2 mono text-[11px] uppercase tracking-widest"
+            style={{ border: `1px solid ${a(accent, 0.45)}`, background: a(accent, 0.07), color: accent }}>
+            {alert && <span className="animate-pulse-dot">⏸ </span>}{label} ▾
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  if (!open) {
+    return (
+      <div className="flex-shrink-0" style={{ width: RAIL.collapsed }}>
+        <div className="sticky top-1">
+          <button
+            onClick={() => setOpen(true)}
+            title="Expand panel"
+            className={`card w-full flex flex-col items-center gap-2 py-3 ${alert ? 'gate-ring' : ''}`}
+            style={{ border: `1px solid ${a(accent, 0.45)}`, background: a(accent, 0.07) }}
+          >
+            <span className="mono text-[12px]" style={{ color: accent }}>{alert ? '⏸' : '«'}</span>
+            <span className="mono text-[10px] uppercase tracking-widest"
+              style={{ color: accent, writingMode: 'vertical-rl', textOrientation: 'mixed' }}>
+              {label}
+            </span>
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex-shrink-0 flex items-stretch" style={{ width }}>
+      <div
+        onPointerDown={e => {
+          drag.current = { x: e.clientX, w: width }
+          setDragging(true)
+          document.body.style.userSelect = 'none'
+        }}
+        onDoubleClick={() => setWidth(RAIL.def)}
+        title="Drag to resize · double-click to reset"
+        className="w-1.5 flex-shrink-0 cursor-col-resize rounded-full mr-2 self-stretch"
+        style={{ background: dragging ? accent : C.border, opacity: dragging ? 0.8 : 1, transition: 'background 0.15s' }}
+      />
+      <div className="flex-1 min-w-0">
+        <div className="sticky top-1">{children}</div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Audit Trail ─────────────────────────────────────────────────────────────
 function AuditTrail({ source }: { source?: DataSource }) {
   const [realRuns, setRealRuns] = useState<{ id: string; domain: string; status: string; rootCause: string; confidence: number; createdAt: string }[]>([])
 
@@ -2686,8 +3236,8 @@ function AuditTrail({ source }: { source?: DataSource }) {
   )
 }
 
-function AgentSection({ model, setModel, domain, setDomain, source, dateRange }: {
-  model: string; setModel: (m: string) => void; domain: DomainFilter; setDomain: (d: DomainFilter) => void; source?: DataSource; dateRange?: DateRange
+function AgentSection({ model, setModel, domain, setDomain, source, dateRange, onContext }: {
+  model: string; setModel: (m: string) => void; domain: DomainFilter; setDomain: (d: DomainFilter) => void; source?: DataSource; dateRange?: DateRange; onContext?: (c: RcaContext) => void
 }) {
   const [running, setRunning] = useState(false)
   const [steps, setSteps] = useState<AgentStep[]>([])
@@ -2697,7 +3247,23 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
   const [gateRunId, setGateRunId] = useState<string | null>(null)
   const [rcaDone, setRcaDone] = useState<{ root_cause?: string; confidence?: number; actions?: string[] } | null>(null)
   const [ollamaModels, setOllamaModels] = useState<{ id: string; name: string; icon: string; provider: string }[]>([])
+  const [actions, setActions] = useState<RemediationAction[]>([])
+  const [executing, setExecuting] = useState(false)
+  const [recovery, setRecovery] = useState(0)
+  const [rejectReason, setRejectReason] = useState('')
+  const [railOpen, setRailOpen] = useState(() => loadPref('logsense.remRail.open', true))
+  const [railWidth, setRailWidth] = useState(() => loadPref('logsense.remRail.width', RAIL.def))
   const resume = useRef<(() => void) | null>(null)
+  const timers = useRef<number[]>([])
+  const operator = 'ops.duty@logsense'
+
+  useEffect(() => { savePref('logsense.remRail.open', railOpen) }, [railOpen])
+  useEffect(() => { savePref('logsense.remRail.width', railWidth) }, [railWidth])
+
+  // A gate opening re-expands the rail even if the operator had collapsed it.
+  useEffect(() => { if (gate === 'awaiting') setRailOpen(true) }, [gate])
+
+  useEffect(() => () => { timers.current.forEach(t => { clearTimeout(t); clearInterval(t) }); timers.current = [] }, [])
 
   // Fetch real Ollama models when on Elastic source; fall back to static list for demo.
   useEffect(() => {
@@ -2720,12 +3286,18 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
   const tenant = DOMAIN_BY_ID[incidentTenant]
 
   const startAgent = useCallback(async () => {
+    timers.current.forEach(t => { clearTimeout(t); clearInterval(t) })
+    timers.current = []
     setRunning(true)
     setSteps([])
     setStreamText('')
     setGate('idle')
     setGateRunId(null)
     setRcaDone(null)
+    setActions([])
+    setExecuting(false)
+    setRecovery(0)
+    setRejectReason('')
 
     // Demo mode: synthetic animation (no real backend needed)
     if (!source || source === 'demo') {
@@ -2807,30 +3379,64 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
     setRunning(false)
   }, [model, incidentTenant, source, dateRange])
 
-  const approve = async () => {
+  // Structured proposals are derived once the run blocks on the human gate.
+  useEffect(() => {
+    if (gate !== 'awaiting' || actions.length) return
+    const gs = steps.find(s => s.gate || s.status === 'blocked') ?? steps[steps.length - 1]
+    if (gs) setActions(parseActions(gs.content, tenant.short, gs.citations))
+  }, [gate, steps, actions.length, tenant.short])
+
+  useEffect(() => {
+    if (!rcaDone?.actions?.length || actions.length) return
+    setActions(parseActions(rcaDone.actions, tenant.short))
+  }, [rcaDone, actions.length, tenant.short])
+
+  /** Walk the approved actions through queued → applying → verified, then recover. */
+  const runExecution = useCallback((ids: string[]) => {
+    setExecuting(true)
+    setActions(prev => prev.map(x => (ids.includes(x.id) ? { ...x, status: 'queued' } : { ...x, status: 'skipped' })))
+    ids.forEach((id, i) => {
+      const at = 500 + i * 900
+      timers.current.push(window.setTimeout(() => setActions(p => p.map(x => (x.id === id ? { ...x, status: 'applying' } : x))), at))
+      timers.current.push(window.setTimeout(() => setActions(p => p.map(x => (x.id === id ? { ...x, status: 'verified' } : x))), at + 1500))
+    })
+    const total = 500 + Math.max(0, ids.length - 1) * 900 + 1600
+    timers.current.push(window.setTimeout(() => {
+      setExecuting(false)
+      const t0 = Date.now()
+      const iv = window.setInterval(() => {
+        const p = Math.min(1, (Date.now() - t0) / 4000)
+        setRecovery(p)
+        if (p >= 1) clearInterval(iv)
+      }, 60)
+      timers.current.push(iv)
+    }, total))
+  }, [])
+
+  const approve = async (ids?: string[]) => {
+    const chosen = ids?.length ? ids : actions.map(x => x.id)
+    setGate('approved')
+    setSteps(prev => prev.map(s => s.gate || s.status === 'blocked' ? { ...s, status: 'done' } : s))
+    runExecution(chosen)
     if (source === 'demo' || !gateRunId) {
       // Demo mode: resume local simulation
-      setGate('approved')
-      setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'done' } : s))
       resume.current?.()
       resume.current = null
       return
     }
-    setGate('approved')
-    setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'done' } : s))
     setRunning(true)
     await fetch(`/agent/rca/${gateRunId}/approve`, { method: 'POST' })
   }
-  const reject = async () => {
+  const reject = async (reason: string) => {
+    setGate('rejected')
+    setRejectReason(reason)
+    setActions(prev => prev.map(x => ({ ...x, status: 'rejected' })))
+    setSteps(prev => prev.map(s => s.gate || s.status === 'blocked' ? { ...s, status: 'rejected' } : s))
     if (source === 'demo' || !gateRunId) {
-      setGate('rejected')
-      setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'rejected' } : s))
       resume.current = null
       setRunning(false)
       return
     }
-    setGate('rejected')
-    setSteps(prev => prev.map(s => s.gate ? { ...s, status: 'rejected' } : s))
     await fetch(`/agent/rca/${gateRunId}/reject`, { method: 'POST' })
     setRunning(false)
   }
@@ -2847,6 +3453,26 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
   const budget = 0.6
   const citationCount = steps.flatMap(s => s.citations ?? []).length
   const complete = (source === 'demo' ? steps.length === 7 : rcaDone !== null) && !running
+
+  // Demo runs have no backend payload, so the verdict is read back off the step log.
+  const verdict = useMemo(() => {
+    if (rcaDone) return rcaDone
+    const rs = steps.find(s => /root cause/i.test(s.phase) && s.status === 'done')
+    if (!rs) return null
+    const bullet = rs.content.split('\n').find(l => l.trim().startsWith('•')) ?? rs.content.split('\n')[1] ?? rs.content
+    return { root_cause: bullet.replace(/^[•\s]+/, '').trim(), confidence: rs.confidence ?? 0.9 }
+  }, [rcaDone, steps])
+
+  // Hand the current investigation to the chat panel so it can be questioned about it.
+  useEffect(() => {
+    onContext?.({
+      scope: tenant.short,
+      gate,
+      rootCause: verdict?.root_cause,
+      confidence: verdict?.confidence,
+      actions,
+    })
+  }, [onContext, tenant.short, gate, verdict, actions])
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
@@ -3001,8 +3627,9 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
         </div>
       </div>
 
-      {/* Workflow steps */}
-      <div className="flex flex-col gap-3">
+      {/* Step log on the left, remediation rail pinned alongside it on the right */}
+      <div className="flex flex-col xl:flex-row gap-4 items-stretch">
+      <div className="flex flex-col gap-3 min-w-0 flex-1">
         {steps.length === 0 && !running && (
           <div className="card p-8 text-center">
             <div className="text-4xl mb-3">◈</div>
@@ -3062,33 +3689,46 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
                 </div>
               )}
 
-              {/* Human-in-the-loop gate */}
+              {/* Human-in-the-loop gate — controls live in the console above */}
               {step.status === 'blocked' && gate === 'awaiting' && (
-                <div className="mt-3 ml-8 p-3 rounded flex items-center gap-3 flex-wrap"
+                <div className="mt-3 ml-8 p-2.5 rounded flex items-center gap-2 flex-wrap"
                   style={{ background: a(C.amber, 0.06), border: `1px solid ${a(C.amber, 0.3)}` }}>
                   <span className="mono text-[11px]" style={{ color: C.amber }}>
-                    ⏸ Agent paused — remediation needs a named human decision
+                    <span className="animate-pulse-dot">⏸</span> Paused — decide in the Remediation console ↑
                   </span>
-                  <div className="flex gap-2 ml-auto">
-                    <button onClick={approve} className="mono text-[11px] px-3 py-1.5 rounded"
-                      style={{ background: a(C.green, 0.12), border: `1px solid ${a(C.green, 0.35)}`, color: C.green }}>
-                      Approve P0 rollback
-                    </button>
-                    <button onClick={reject} className="mono text-[11px] px-3 py-1.5 rounded"
-                      style={{ background: a(C.red, 0.1), border: `1px solid ${a(C.red, 0.3)}`, color: C.red }}>
-                      Reject & escalate
-                    </button>
-                  </div>
                 </div>
               )}
               {step.status === 'rejected' && (
                 <div className="mt-3 ml-8 mono text-[11px]" style={{ color: C.red }}>
-                  Rejected by operator · escalated to MPS on-call · agent run halted and logged.
+                  Rejected by {operator} · {rejectReason || 'no reason given'} · escalated to on-call, agent run halted and logged.
                 </div>
               )}
             </div>
           )
         })}
+      </div>
+
+      <ResizableRail
+        open={railOpen}
+        setOpen={setRailOpen}
+        width={railWidth}
+        setWidth={setRailWidth}
+        accent={gate === 'awaiting' ? C.amber : gate === 'rejected' ? C.red : gate === 'approved' ? C.green : C.faint}
+        alert={gate === 'awaiting'}
+        label="Remediation"
+      >
+        <RemediationConsole
+          actions={actions}
+          gate={gate}
+          onApprove={approve}
+          onReject={reject}
+          scope={tenant.short}
+          operator={operator}
+          recovery={recovery}
+          executing={executing}
+          onCollapse={() => setRailOpen(false)}
+        />
+      </ResizableRail>
       </div>
 
       {/* Ruled out — demo mode only; real mode doesn't generate a ruled-out list yet */}
@@ -3111,25 +3751,19 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange }:
         </div>
       )}
 
-      {/* Verdict — populated from real RCA response */}
-      {complete && gate !== 'rejected' && rcaDone && (
+      {/* Verdict — backend payload when available, otherwise read back off the step log */}
+      {complete && gate !== 'rejected' && verdict && (
         <div className="card p-4" style={{ border: `1px solid ${a(C.green, 0.2)}`, background: a(C.green, 0.03) }}>
           <div className="mono text-[11px] text-[var(--c-green)] uppercase tracking-widest mb-3">
-            ✓ Analysis complete · {currentModel.name} · {citationCount} citations · approved by operator
+            ✓ Analysis complete · {currentModel.name} · {citationCount} citations · approved by {operator}
           </div>
           <div className="mono text-[11px] text-[var(--c-text2)] mb-3 p-2 rounded" style={{ background: a(C.cyan, 0.04), border: `1px solid ${a(C.cyan, 0.12)}` }}>
-            {rcaDone.root_cause} ({((rcaDone.confidence ?? 0) * 100).toFixed(0)}% confidence)
+            {verdict.root_cause} ({((verdict.confidence ?? 0) * 100).toFixed(0)}% confidence)
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {(rcaDone.actions ?? []).slice(0, 3).map((action, i) => {
-              const col = i === 0 ? C.red : C.amber
-              return (
-                <div key={i} className="p-3 rounded" style={{ background: C.bg, border: `1px solid ${col}30` }}>
-                  <div className="mono text-[10px] font-bold mb-1" style={{ color: col }}>{i === 0 ? 'P0' : 'P1'}</div>
-                  <div className="mono text-[11px] text-[var(--c-text2)]">{action}</div>
-                </div>
-              )
-            })}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-2.5">
+            {actions.map(action => (
+              <RemediationActionCard key={action.id} action={action} selectable={false} selected={false} />
+            ))}
           </div>
         </div>
       )}
@@ -3502,16 +4136,46 @@ function OfflineUploadPanel({ onReady }: { onReady: (from: Date, to: Date) => vo
 
 const LS_ES_CONFIG = 'logsense-es-config'
 
-function loadEsConfig() {
+interface EsConfig {
+  url: string
+  username: string
+  password: string
+  indices: Record<string, string>
+  /** Display names for auto-detected streams, keyed by tenant id. */
+  names: Record<string, string>
+}
+
+function loadEsConfig(): EsConfig | null {
   try {
     const raw = localStorage.getItem(LS_ES_CONFIG)
-    if (raw) return JSON.parse(raw) as { url: string; username: string; password: string; indices: Record<string, string> }
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<EsConfig>
+    return {
+      url: parsed.url ?? '/es',
+      username: parsed.username ?? '',
+      password: parsed.password ?? '',
+      indices: parsed.indices ?? {},
+      names: parsed.names ?? {},
+    }
   } catch {}
   return null
 }
 
-function saveEsConfig(cfg: { url: string; username: string; password: string; indices: Record<string, string> }) {
+function saveEsConfig(cfg: EsConfig) {
   localStorage.setItem(LS_ES_CONFIG, JSON.stringify(cfg))
+}
+
+let esConfigApplied = false
+
+/** Runs before the first discovery so saved names/indices are live on the initial poll. */
+function applySavedEsConfig() {
+  if (esConfigApplied) return
+  esConfigApplied = true
+  const saved = loadEsConfig()
+  if (!saved) return
+  setEsRuntimeConfig({ url: saved.url, username: saved.username, password: saved.password })
+  for (const [id, idx] of Object.entries(saved.indices)) setEsTenantIndex(id, idx)
+  for (const [id, label] of Object.entries(saved.names)) setEsTenantName(id, label)
 }
 
 function SourcePill({ source, setSource, es, onOfflineReady }: {
@@ -3525,9 +4189,17 @@ function SourcePill({ source, setSource, es, onOfflineReady }: {
   const [username, setUsername] = useState(stored?.username ?? 'elastic')
   const [password, setPassword] = useState(stored?.password ?? '')
   const [indices, setIndices] = useState<Record<string, string>>(
-    stored?.indices ?? Object.fromEntries(ES_TENANTS.map(t => [t.id, t.index]))
+    stored?.indices ?? {}
   )
+  const [names, setNames] = useState<Record<string, string>>(stored?.names ?? {})
   const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    setIndices(current => Object.fromEntries(es.tenants.map(tenant => [
+      tenant.id,
+      current[tenant.id] ?? tenant.index,
+    ])))
+  }, [es.tenants])
 
   useEffect(() => {
     function onDown(e: MouseEvent) {
@@ -3538,10 +4210,11 @@ function SourcePill({ source, setSource, es, onOfflineReady }: {
   }, [])
 
   function applyConfig() {
-    const cfg = { url, username, password, indices }
+    const cfg = { url, username, password, indices, names }
     saveEsConfig(cfg)
     setEsRuntimeConfig({ url, username, password })
     for (const [id, idx] of Object.entries(indices)) setEsTenantIndex(id, idx)
+    for (const tenant of es.tenants) setEsTenantName(tenant.id, names[tenant.id] ?? '')
     es.refresh()
     setEditConfig(false)
   }
@@ -3574,7 +4247,7 @@ function SourcePill({ source, setSource, es, onOfflineReady }: {
           <div className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest">Data source</div>
 
           {([['demo', 'Demo generator', '5 synthetic tenants'],
-            ['elastic', 'Elasticsearch', ES_TENANTS.map(t => t.index).join(' · ')],
+            ['elastic', 'Elasticsearch', es.tenants.length ? es.tenants.map(t => t.index).join(' · ') : 'Discovering logs-* data streams'],
             ['file', 'Offline Analysis', 'upload logs → pipeline → ES']] as [DataSource, string, string][])
             .map(([id, name, sub]) => (
               <button
@@ -3659,17 +4332,25 @@ function SourcePill({ source, setSource, es, onOfflineReady }: {
                         style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
                     </label>
                   </div>
-                  <div className="mono text-[9px] uppercase tracking-widest mt-1" style={{ color: C.faint }}>Index patterns (data streams)</div>
-                  {ES_TENANTS.map(t => (
-                    <label key={t.id} className="flex items-center gap-2">
-                      <span className="mono text-[10px] w-10 flex-shrink-0" style={{ color: C.dim }}>{t.short}</span>
+                  <div className="mono text-[9px] uppercase tracking-widest mt-1" style={{ color: C.faint }}>Data streams — display name · index pattern</div>
+                  {es.tenants.map(t => (
+                    <div key={t.id} className="flex items-center gap-2">
+                      <input value={names[t.id] ?? ''}
+                        onChange={e => setNames(p => ({ ...p, [t.id]: e.target.value }))}
+                        placeholder={t.label}
+                        title={`Display name for ${t.index}`}
+                        className="mono text-[11px] px-2 py-1 rounded outline-none w-24 flex-shrink-0"
+                        style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
                       <input value={indices[t.id] ?? t.index}
                         onChange={e => setIndices(p => ({ ...p, [t.id]: e.target.value }))}
                         placeholder={t.index}
-                        className="mono text-[11px] px-2 py-1 rounded outline-none flex-1"
+                        className="mono text-[11px] px-2 py-1 rounded outline-none flex-1 min-w-0"
                         style={{ background: C.bg, border: `1px solid ${C.border}`, color: C.text }} />
-                    </label>
+                    </div>
                   ))}
+                  {!es.tenants.length && (
+                    <div className="mono text-[10px]" style={{ color: C.faint }}>No data streams discovered yet.</div>
+                  )}
                   <div className="flex gap-2 mt-1">
                     <button onClick={applyConfig}
                       className="mono text-[11px] px-3 py-1.5 rounded"
@@ -3720,7 +4401,7 @@ function TeamsSection({ logs, domain, setDomain, esServices }: {
   }, [teamId, fallbackTeam])
 
   const d = DOMAIN_BY_ID[teamId]
-  const profile = TEAM_PROFILES[teamId]
+  const profile = teamProfile(teamId)
   const col = domainColor(teamId)
   const rollups = esServices?.[teamId]
   const services = d.services.map(svc => ({
@@ -4025,7 +4706,7 @@ function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }
   setTimeWindow?: (w: TimeWindow) => void
 }) {
   const d = DOMAIN_BY_ID[domain]
-  const profile = TEAM_PROFILES[domain]
+  const profile = teamProfile(domain)
   const isElastic = data.source !== 'demo'
   const liveRollup = data.services?.length ? data.services : undefined
   const domainLogs = logs.filter(l => l.domain === domain)
@@ -4959,6 +5640,7 @@ function AppInner() {
   const [model, setModel] = useState('claude-sonnet-5')
   const [customAgents, setCustomAgents] = useState<CustomAgentDef[]>([])
   const [agentMetrics, setAgentMetrics] = useState<AgentMetric[]>([])
+  const [rcaContext, setRcaContext] = useState<RcaContext | null>(null)
   const [domain, setDomain] = useState<DomainFilter>('mps')
   const [source, setSource] = useState<DataSource>(
     () => (import.meta.env.VITE_DATA_SOURCE === 'elastic' ? 'elastic' : 'demo')
@@ -4977,16 +5659,8 @@ function AppInner() {
   const esAggHours = dateRange
     ? Math.max(1, Math.ceil((dateRange.to.getTime() - dateRange.from.getTime()) / 3_600_000))
     : 24
+  applySavedEsConfig()
   const es = useElasticStream({ enabled: source === 'elastic', live, pollMs: 5000, since: esSince, aggHours: esAggHours })
-
-  // Apply any saved ES config on first render so the hook connects with the right credentials.
-  useEffect(() => {
-    const saved = loadEsConfig()
-    if (saved) {
-      setEsRuntimeConfig({ url: saved.url, username: saved.username, password: saved.password })
-      for (const [id, idx] of Object.entries(saved.indices)) setEsTenantIndex(id, idx)
-    }
-  }, [])
 
   // Reset the ES cursor whenever the date range changes so new since/until are applied.
   useEffect(() => {
@@ -4994,7 +5668,7 @@ function AppInner() {
   }, [esSince, esAggHours])
 
   // Swap the tenant registry with the data source, before children render.
-  const esDomains = useMemo(() => elasticDomains(es.services), [es.services])
+  const esDomains = useMemo(() => elasticDomains(es.tenants, es.services), [es.tenants, es.services])
   setTenantRegistry(source === 'elastic' ? esDomains : DEMO_DOMAINS)
 
   // If the selected domain isn't in the new registry (e.g. 'pis' in Elastic mode which
@@ -5005,7 +5679,7 @@ function AppInner() {
   // A tenant from the other registry cannot stay selected across a source swap.
   useEffect(() => {
     if (!DOMAINS.some(d => d.id === domain)) setDomain(DOMAINS[0]?.id ?? 'mps')
-  }, [source, domain])
+  }, [source, domain, esDomains])
 
   const systemDark = usePrefersDark()
   const isDark = themeMode === 'system' ? systemDark : themeMode === 'dark'
@@ -5051,7 +5725,7 @@ function AppInner() {
   const esVolume = useMemo(() => {
     if (source !== 'elastic') return undefined
     const rows = new Map<string, Record<string, number | string>>()
-    for (const t of ES_TENANTS) {
+    for (const t of es.tenants) {
       for (const b of es.volume[t.id] ?? []) {
         const row = rows.get(b.time) ?? { time: b.time, total: 0, errors: 0, warns: 0 }
         row[t.id] = b.total
@@ -5062,7 +5736,7 @@ function AppInner() {
       }
     }
     return [...rows.values()].sort((x, y) => String(x.time).localeCompare(String(y.time)))
-  }, [source, es.volume])
+  }, [source, es.tenants, es.volume])
 
   return (
     <div className="flex h-screen overflow-hidden terminal-grid" style={{ background: C.bg }}>
@@ -5274,7 +5948,7 @@ function AppInner() {
           {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'anomalies' && <AnomalySection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'sla' && <SLASection domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
-          {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} />}
+          {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} onContext={setRcaContext} />}
           {section === 'agent' && <CustomAgentSection domain={safeDomain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
           {section === 'pipeline' && <PipelineSection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'aimonitor' && <AIMonitorSection metrics={agentMetrics} />}
@@ -5293,6 +5967,7 @@ function AppInner() {
         setWide={setAskWide}
         source={source}
         dateRange={dateRange}
+        rcaContext={rcaContext}
         onMetric={m => setAgentMetrics(prev => [...prev.slice(-499), m])}
       />
     </div>

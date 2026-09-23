@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { LogEntry } from './types'
 import {
-  ES_TENANTS, EsError, fetchErrorTypes, fetchServices, fetchVolume, searchLogs, searchAllLogs,
-  type ErrorTypeBucket, type ServiceRollup, type VolumeBucket,
+  discoverElasticTenants, EsError, fetchErrorTypes, fetchServices, fetchVolume, searchLogs, searchAllLogs,
+  type ErrorTypeBucket, type EsTenant, type ServiceRollup, type VolumeBucket,
 } from './elastic'
 
 export type EsStatus = 'off' | 'connecting' | 'live' | 'error'
@@ -10,6 +10,7 @@ export type EsStatus = 'off' | 'connecting' | 'live' | 'error'
 export interface EsState {
   status: EsStatus
   error: string | null
+  tenants: EsTenant[]
   logs: LogEntry[]
   /** Keyed by tenant id. */
   volume: Record<string, VolumeBucket[]>
@@ -80,6 +81,7 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
 
   const [status, setStatus] = useState<EsStatus>('off')
   const [error, setError] = useState<string | null>(null)
+  const [tenants, setTenants] = useState<EsTenant[]>([])
   const [logs, setLogs] = useState<LogEntry[]>([])
   // Restore aggregated data from sessionStorage so panels show data immediately after refresh.
   const [volume, setVolume] = useState<Record<string, VolumeBucket[]>>(cached?.volume ?? {})
@@ -115,13 +117,24 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
     const ctrl = new AbortController()
     let timer: number | undefined
     let stopped = false
+    let activeTenants: EsTenant[] = []
+
+    const tenantSignature = (items: EsTenant[]) => items.map(tenant => `${tenant.id}:${tenant.index}`).join('|')
 
     const poll = async () => {
       const t0 = performance.now()
       try {
         const wantAggs = pollCount.current % AGG_EVERY === 0
 
-        const results = await Promise.all(ES_TENANTS.map(async t => {
+        if (pollCount.current > 0 && wantAggs) {
+          const discovered = await discoverElasticTenants(ctrl.signal)
+          if (tenantSignature(discovered) !== tenantSignature(activeTenants)) {
+            activeTenants = discovered
+            setTenants(discovered)
+          }
+        }
+
+        const results = await Promise.all(activeTenants.map(async t => {
           // First load or after refresh: stream all pages, updating state after each.
           // Subsequent polls use a cursor to only fetch new documents (live tail).
           const hasCursor = !!cursors.current[t.id]
@@ -219,8 +232,25 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
       }
     }
 
-    setStatus('connecting')
-    poll()
+    const connect = async () => {
+      setStatus('connecting')
+      try {
+        activeTenants = await discoverElasticTenants(ctrl.signal)
+        if (stopped) return
+        setTenants(activeTenants)
+        await poll()
+      } catch (err) {
+        if (stopped || (err as Error).name === 'AbortError') return
+        setStatus('error')
+        setError(
+          err instanceof EsError
+            ? err.message
+            : `Cannot discover Elasticsearch data streams — ${(err as Error).message}`,
+        )
+      }
+    }
+
+    connect()
 
     return () => {
       stopped = true
@@ -229,5 +259,5 @@ export function useElasticStream({ enabled, live, pollMs = 5000, since = 'now-24
     }
   }, [enabled, live, pollMs, since, until, aggHours, nonce])
 
-  return { status, error, logs, volume, services, errorTypes, latencyMs, lastPoll, docsSeen, refresh }
+  return { status, error, tenants, logs, volume, services, errorTypes, latencyMs, lastPoll, docsSeen, refresh }
 }
