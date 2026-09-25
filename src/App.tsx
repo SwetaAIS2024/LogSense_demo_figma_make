@@ -2320,10 +2320,15 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
   const modelList = agentModels.length > 0 ? agentModels : LLM_MODELS
   const currentModel = modelList.find(m => m.id === model) || modelList[0]
 
+  // A selection from the static catalogue is meaningless once Ollama answers — snap to a real one.
   useEffect(() => {
     fetch('/agent/models')
       .then(r => r.json())
-      .then(j => { if (j.ok && j.models.length) setAgentModels(j.models) })
+      .then(j => {
+        if (!j.ok || !j.models.length) return
+        setAgentModels(j.models)
+        if (!j.models.some((m: { id: string }) => m.id === model)) setModel(j.models[0].id)
+      })
       .catch(() => {})
   }, [])
 
@@ -2647,7 +2652,7 @@ const MODEL_RATES: Record<string, { in: number; out: number }> = {
 const FAST_MODEL = { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', rate: { in: 0.8, out: 4 } }
 
 function stepCost(step: AgentStep, reasoningModel: string) {
-  const rate = step.routed === 'fast' ? FAST_MODEL.rate : (MODEL_RATES[reasoningModel] ?? MODEL_RATES['claude-sonnet-5'])
+  const rate = MODEL_RATES[reasoningModel] ?? MODEL_RATES['claude-sonnet-5']
   return (step.tokensIn / 1e6) * rate.in + (step.tokensOut / 1e6) * rate.out
 }
 
@@ -3271,11 +3276,12 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange, o
     fetch('/agent/models')
       .then(r => r.json())
       .then(j => {
-        if (j.ok && j.models.length) {
-          setOllamaModels(j.models.map((m: { id: string; name: string }) => ({
-            id: m.id, name: m.name, icon: '⬡', provider: 'Ollama',
-          })))
-        }
+        if (!j.ok || !j.models.length) return
+        const list = j.models.map((m: { id: string; name: string }) => ({
+          id: m.id, name: m.name, icon: '⬡', provider: 'Ollama',
+        }))
+        setOllamaModels(list)
+        if (!list.some((m: { id: string }) => m.id === model)) setModel(list[0].id)
       })
       .catch(() => {})
   }, [source])
@@ -3533,7 +3539,7 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange, o
               })}
               {(!source || source === 'demo') && (
                 <div className="mono text-[10px] text-[var(--c-faint)] px-3 py-2 border-t" style={{ borderColor: C.border }}>
-                  Retrieval phases are pinned to {FAST_MODEL.name} regardless of this choice.
+                  Every phase runs on this model — fast/reasoning routing shown per step is illustrative only.
                 </div>
               )}
             </div>
@@ -3635,7 +3641,7 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange, o
             <div className="text-4xl mb-3">◈</div>
             <div className="mono text-[13px] text-[var(--c-dim)]">Run the agent to produce a cited, cost-metered RCA</div>
             <div className="mono text-[11px] text-[var(--c-faint)] mt-1">
-              7 phases · retrieval on {FAST_MODEL.name} · reasoning on {currentModel.name}
+              7 phases · all phases run on {currentModel.name}
             </div>
           </div>
         )}
@@ -3644,7 +3650,7 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange, o
             : step.status === 'running' ? C.cyan
             : step.status === 'blocked' ? C.amber
             : step.status === 'rejected' ? C.red : C.border
-          const routedName = step.routed === 'fast' ? FAST_MODEL.name : currentModel.name
+          const routedName = currentModel.name
           return (
             <div key={step.id} className="card p-4 animate-fade-up" style={{ borderTop: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, borderLeft: `2px solid ${col}` }}>
               <div className="flex items-center gap-3 mb-2 flex-wrap">
@@ -5637,7 +5643,9 @@ function AppInner() {
     const to = new Date()
     setDateRange({ from: new Date(to.getTime() - ms), to, label: TIME_WINDOWS.find(t => t.id === w)?.label ?? w })
   }
-  const [model, setModel] = useState('claude-sonnet-5')
+  // Each surface talks to a different runtime, so each keeps its own model selection.
+  const [rcaModel, setRcaModel] = useState('claude-sonnet-5')
+  const [chatModel, setChatModel] = useState('claude-sonnet-5')
   const [customAgents, setCustomAgents] = useState<CustomAgentDef[]>([])
   const [agentMetrics, setAgentMetrics] = useState<AgentMetric[]>([])
   const [rcaContext, setRcaContext] = useState<RcaContext | null>(null)
@@ -5716,7 +5724,6 @@ function AppInner() {
     return () => clearInterval(id)
   }, [live, source])
 
-  const currentModel = LLM_MODELS.find(m => m.id === model) || LLM_MODELS[0]
   const activeLogs = source === 'elastic' ? es.logs : logs
   const activeData = useActiveData(source, safeDomain, es)
   const visibleLogs = activeLogs.filter(l => l.domain === safeDomain)
@@ -5874,12 +5881,6 @@ function AppInner() {
             <span>Ask</span>
             <span className="text-[var(--c-faint)]">⌘K</span>
           </button>
-
-          {/* Model badge */}
-          <div className="mono text-[10px] px-2 py-1 rounded flex items-center gap-1.5" style={{ background: a(C.purple,0.08), border: `1px solid ${a(C.purple,0.2)}`, color: C.purple }}>
-            <span>{currentModel.icon}</span>
-            <span>{currentModel.name}</span>
-          </div>
         </header>
 
         {/* LoB bar — scopes every section below */}
@@ -5948,7 +5949,7 @@ function AppInner() {
           {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'anomalies' && <AnomalySection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'sla' && <SLASection domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
-          {section === 'rca' && <AgentSection model={model} setModel={setModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} onContext={setRcaContext} />}
+          {section === 'rca' && <AgentSection model={rcaModel} setModel={setRcaModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} onContext={setRcaContext} />}
           {section === 'agent' && <CustomAgentSection domain={safeDomain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
           {section === 'pipeline' && <PipelineSection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'aimonitor' && <AIMonitorSection metrics={agentMetrics} />}
@@ -5961,8 +5962,8 @@ function AppInner() {
         onClose={() => setAskOpen(false)}
         logs={visibleLogs}
         domain={safeDomain}
-        model={model}
-        setModel={setModel}
+        model={chatModel}
+        setModel={setChatModel}
         wide={askWide}
         setWide={setAskWide}
         source={source}
