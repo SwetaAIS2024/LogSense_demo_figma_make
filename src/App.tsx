@@ -2186,24 +2186,23 @@ function answerQuestion(q: string, logs: LogEntry[], domain: DomainFilter): Omit
   }
 
   // ── Default: top services by error count ──────────────────────────────────
-  const byService = new Map<string, { total: number; errs: number; dom: DomainId }>()
-  for (const l of logs) {
-    const e = byService.get(l.service) ?? { total: 0, errs: 0, dom: l.domain }
-    e.total++
-    if (isErr(l)) e.errs++
-    byService.set(l.service, e)
-  }
-  const ranked = [...byService.entries()]
-    .sort((x, y) => y[1].errs - x[1].errs)
+  // Uses the same smooth per-service rate the Services panel shows (serviceStats()),
+  // not a tally over the tiny live buffer — keeps both views consistent and realistic.
+  const ranked = scope.flatMap(d => d.services.map(svc => {
+    const s = serviceStats(svc)
+    const events = s.logsPerMin * 60 // approx hourly volume, matches "Events/min" on screen
+    const errs = Math.round(events * (s.errRate / 100))
+    return { svc, dom: d.id, errs, events, errRate: s.errRate }
+  }))
+    .sort((x, y) => y.errs - x.errs)
     .slice(0, 10)
-    .map(([svc, v], i) => [
-      i + 1, svc, DOMAIN_BY_ID[v.dom]?.short ?? v.dom, v.errs, v.total,
-      v.total ? `${((v.errs / v.total) * 100).toFixed(1)}%` : '—',
+    .map((v, i) => [
+      i + 1, v.svc, DOMAIN_BY_ID[v.dom]?.short ?? v.dom, v.errs, v.events, `${v.errRate}%`,
     ] as (string | number)[])
 
   return {
     text: ranked.length
-      ? `Top services by error count across ${scopeLabel}, from the ${logs.length.toLocaleString()} events currently buffered. ${ranked[0][1]} leads with ${ranked[0][3]} errors.`
+      ? `Top services by error count across ${scopeLabel}, over the last hour. ${ranked[0][1]} leads with ${ranked[0][3].toLocaleString()} errors (${ranked[0][5]} error rate).`
       : `Nothing buffered yet for ${scopeLabel}. Start the stream or widen the tenant scope and ask again.`,
     tools: [{
       name: 'search', target: indices, ms: 112, rows: logs.length,
@@ -2220,7 +2219,7 @@ function answerQuestion(q: string, logs: LogEntry[], domain: DomainFilter): Omit
       rows: ranked,
     } : undefined,
     observations: ranked.length ? [
-      `${ranked[0][1]} accounts for ${((Number(ranked[0][3]) / Math.max(1, logs.filter(isErr).length)) * 100).toFixed(0)}% of all errors in the window.`,
+      `${ranked[0][1]} accounts for ${((Number(ranked[0][3]) / Math.max(1, ranked.reduce((n, r) => n + Number(r[3]), 0))) * 100).toFixed(0)}% of all errors shown here.`,
       'Error rate matters more than raw count — a low-traffic service at 30% is usually the better lead.',
     ] : undefined,
     tokens, cost,
@@ -2349,6 +2348,10 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
     ])
 
     try {
+      // Demo mode has no backing Elasticsearch data — the real agent would see an
+      // empty index and contradict what's on screen. Answer locally from `logs` instead.
+      if (!source || source === 'demo') throw new Error('demo mode — use the local responder')
+
       const res = await fetch('/agent/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2408,8 +2411,9 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
     } catch (err) {
       // Fall back to demo answers when the agent service is not running.
       const answer = rcaContext?.actions.length && /remediat|rollback|action|approve|fix|mitigat/i.test(q)
-        ? { text: `Assessing the remediation currently proposed for ${rcaContext.scope}:\n\n${formatRcaContext(rcaContext)}\n\nThe P0 items are reversible and target the confirmed root cause, so they are safe to approve first; the P1 items are the durable fix and can follow through normal change control.` }
+        ? { text: `Assessing the remediation currently proposed for ${rcaContext.scope}:\n\n${formatRcaContext(rcaContext)}\n\nThe P0 items are reversible and target the confirmed root cause, so they are safe to approve first; the P1 items are the durable fix and can follow through normal change control.`, tokens: 1200, cost: 0.0108 }
         : answerQuestion(q, logs, domain)
+      const t0 = performance.now()
       let i = 0
       await new Promise<void>(resolve => {
         const timer = setInterval(() => {
@@ -2422,6 +2426,35 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
           }
         }, 16)
       })
+
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0))
+      const totalTok = answer.tokens ?? 1200
+      const inputTok = Math.round(totalTok * 0.75)
+      const outputTok = totalTok - inputTok
+      const metric: AgentMetric = {
+        id: agentId,
+        timestamp: new Date().toISOString(),
+        sessionId,
+        domain,
+        model,
+        inputTokens: inputTok,
+        outputTokens: outputTok,
+        latencyMs,
+        tokPerSec: Number((outputTok / Math.max(latencyMs / 1000, 0.001)).toFixed(1)),
+        questionSnippet: q.slice(0, 80),
+      }
+      onMetric?.(metric)
+      setMessages(prev => prev.map(m =>
+        m.id === agentId ? { ...m, inputTokens: metric.inputTokens, outputTokens: metric.outputTokens, latencyMs: metric.latencyMs, tokPerSec: metric.tokPerSec } : m
+      ))
+      fetch('/agent/demo-trace', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: `${sessionId}-${domain}`, domain, model, question: q, answer: answer.text,
+          input_tokens: inputTok, output_tokens: outputTok, latency_ms: latencyMs,
+        }),
+      }).catch(() => {})
     }
 
     setMessages(prev => prev.map(m => m.id === agentId ? { ...m, streaming: false } : m))
@@ -2557,8 +2590,6 @@ function AskPanel({ open, onClose, logs, domain, model, setModel, wide, setWide,
                   ) : (
                     <>
                       <span>~{m.tokens?.toLocaleString()} tokens</span>
-                      <span>·</span>
-                      <span className="opacity-50">demo mode</span>
                     </>
                   )}
                   <span>·</span>
@@ -3685,8 +3716,8 @@ function AgentSection({ model, setModel, domain, setDomain, source, dateRange, o
 
               {step.citations && step.status !== 'running' && (
                 <div className="flex flex-wrap gap-1.5 mt-2 ml-8">
-                  {step.citations.map(c => (
-                    <span key={c} className="mono text-[9px] px-1.5 py-0.5 rounded cursor-pointer"
+                  {step.citations.map((c, ci) => (
+                    <span key={`${ci}-${c}`} className="mono text-[9px] px-1.5 py-0.5 rounded cursor-pointer"
                       style={{ background: a(C.cyan, 0.08), border: `1px solid ${a(C.cyan, 0.18)}`, color: C.cyan }}
                       title="Open the exact evidence this claim rests on">
                       {c}
@@ -3971,6 +4002,10 @@ function PipelineSection({ domain, timeWindow, setTimeWindow, data }: { domain: 
 // ─── Offline Upload Panel ─────────────────────────────────────────────────────
 
 const UPLOAD_BASE = import.meta.env.VITE_UPLOAD_URL || ''
+
+/** Self-hosted Langfuse UI — internal-only host, never a public/SaaS endpoint. */
+const LANGFUSE_URL = import.meta.env.VITE_LANGFUSE_URL || 'http://localhost:3000'
+const LANGFUSE_PROJECT_ID = 'logsense-demo'
 
 type UploadPhase = 'idle' | 'uploading' | 'processing' | 'ready' | 'error'
 
@@ -4703,13 +4738,14 @@ function TeamsSection({ logs, domain, setDomain, esServices }: {
 // Replaces both OverviewSection and TeamsSection. Shows summary KPIs then the
 // detailed per-service breakdown for the selected LoB.
 
-function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }: {
+function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow, dateRange }: {
   logs: LogEntry[]
   domain: DomainFilter
   setDomain: (d: DomainFilter) => void
   data: ActiveData
   timeWindow?: TimeWindow
   setTimeWindow?: (w: TimeWindow) => void
+  dateRange?: DateRange
 }) {
   const d = DOMAIN_BY_ID[domain]
   const profile = teamProfile(domain)
@@ -4718,6 +4754,16 @@ function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }
   const domainLogs = logs.filter(l => l.domain === domain)
   const errLogs = domainLogs.filter(l => l.severity === 'CRITICAL' || l.severity === 'ERROR')
   const errorRate = domainLogs.length ? ((errLogs.length / domainLogs.length) * 100).toFixed(1) : '0.0'
+  // Rollups aggregate the whole selected range, not a fixed hour — pick a unit that
+  // stays readable at any window length instead of forcing everything into "/min"
+  // (a service with 9 events over a year rounds to "0/min", which reads as a bug).
+  const windowMinutes = dateRange ? Math.max(1, (dateRange.to.getTime() - dateRange.from.getTime()) / 60_000) : 60
+  const windowLabel = dateRange?.label ?? timeWindow ?? '1h'
+  const rateUnit = windowMinutes <= 180 ? { per: 1, label: 'events/min' }
+    : windowMinutes <= 10_080 ? { per: 60, label: 'events/hr' }
+    : windowMinutes <= 43_200 ? { per: 1_440, label: 'events/day' }
+    : { per: 0, label: 'events (total)' }
+  const toRate = (events: number) => rateUnit.per ? Number((events / (windowMinutes / rateUnit.per)).toFixed(1)) : events
 
   // When on Elastic source: use real rollup if available, else show empty (not demo).
   const svcList = liveRollup ? liveRollup.map(s => s.service) : (isElastic ? [] : d.services)
@@ -4726,13 +4772,13 @@ function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }
         status: (r.errRate > 5 ? 'degraded' : r.errRate > 2 ? 'watch' : 'healthy') as 'healthy' | 'watch' | 'degraded',
         errRate: r.errRate,
         p99: r.p99,
-        logsPerMin: Math.round(r.events / 60),
+        logsPerMin: toRate(r.events),
         runtime: 'live',
         version: 'v—',
       }))
     : (isElastic ? [] : svcList.map(s => serviceStats(s)))
   const logRate = liveRollup
-    ? liveRollup.reduce((n, s) => n + s.events, 0)
+    ? toRate(liveRollup.reduce((n, s) => n + s.events, 0))
     : (isElastic ? 0 : Math.floor(d.share * 4200))
   const active = svcStats.filter(s => s.status !== 'degraded')
   const inactive = svcStats.filter(s => s.status === 'degraded')
@@ -4741,23 +4787,6 @@ function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
-      {/* Time window + LoB tabs */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="flex gap-2">
-          {DOMAINS.map(t => (
-            <button key={t.id} onClick={() => setDomain(t.id)}
-              className="mono text-[11px] px-2 py-1 rounded flex items-center gap-1.5 transition-colors"
-              style={{
-                background: domain === t.id ? a(domainColor(t.id), 0.14) : 'transparent',
-                border: `1px solid ${domain === t.id ? a(domainColor(t.id), 0.45) : C.border}`,
-                color: domain === t.id ? domainColor(t.id) : C.dim,
-              }}>
-              <span>{t.icon}</span><span>{t.short}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-
       {/* Summary banner */}
       <div className="card p-4 flex items-start gap-4" style={{ borderTop: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, borderLeft: `3px solid ${col}` }}>
         <div className="flex-1">
@@ -4777,17 +4806,17 @@ function LobSection({ logs, domain, setDomain, data, timeWindow, setTimeWindow }
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard label="Active Services" value={String(active.length)} sub={`of ${svcList.length} total`} color={C.green} />
         <StatCard label="Inactive / Degraded" value={String(inactive.length)} sub="error rate > 5%" color={inactive.length > 0 ? C.red : C.dim} />
-        <StatCard label="Log Rate" value={`${logRate.toLocaleString()}/min`} sub={`${timeWindow ?? '1h'} window`} color={col} />
+        <StatCard label="Log Rate" value={`${logRate.toLocaleString()}${liveRollup ? '' : '/min'}`} sub={liveRollup ? `${rateUnit.label} · ${windowLabel}` : `${windowLabel} window`} color={col} />
         <StatCard label="Error Rate" value={`${errorRate}%`} sub="of sampled events" color={Number(errorRate) > 5 ? C.red : Number(errorRate) > 2 ? C.amber : C.dim} />
       </div>
 
       {/* Service list */}
       <div className="card p-4">
-        <SectionHeader title="Services" sub={`${d.team} · ${timeWindow ?? '1h'} window`} />
+        <SectionHeader title="Services" sub={`${d.team} · ${windowLabel} window`} />
         <div className="mono text-[10px] text-[var(--c-faint)] grid gap-2 px-1 pb-2 uppercase tracking-widest"
           style={{ gridTemplateColumns: '180px 70px 70px 1fr 80px 80px' }}>
           <span>Service</span><span className="text-right">Err %</span><span className="text-right">p99</span>
-          <span>Error budget</span><span className="text-right">Events/min</span><span className="text-right">Status</span>
+          <span>Error budget</span><span className="text-right">{liveRollup ? rateUnit.label : 'Events/min'}</span><span className="text-right">Status</span>
         </div>
         <div className="flex flex-col gap-px">
           {svcStats.length === 0 && isElastic && (
@@ -4848,7 +4877,8 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
   data: ActiveData
 }) {
   const isElastic = data.source !== 'demo'
-  const slaRows = DOMAINS.map(d => {
+  const teamDomains = DOMAINS.filter(d => d.id === domain)
+  const slaRows = teamDomains.map(d => {
     const rollup = data.allServices?.[d.id]?.length ? data.allServices[d.id] : undefined
     const realErrRate = rollup
       ? rollup.reduce((s, r) => s + r.errRate * r.events, 0) / Math.max(1, rollup.reduce((s, r) => s + r.events, 0))
@@ -4867,12 +4897,12 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
   // Burn trend: real volume when available; empty on Elastic with no data; seeded only in demo mode.
   const burnTrend = useMemo(() => {
     if (data.allVolume) {
-      const tenants = DOMAINS.filter(d => data.allVolume![d.id]?.length)
+      const tenants = teamDomains.filter(d => data.allVolume![d.id]?.length)
       if (tenants.length > 0) {
         const maxLen = Math.max(...tenants.map(d => data.allVolume![d.id].length))
         return Array.from({ length: maxLen }, (_, i) => {
           const row: Record<string, number | string> = { time: '' }
-          for (const d of DOMAINS) {
+          for (const d of teamDomains) {
             const buckets = data.allVolume![d.id]
             if (!buckets?.length) continue
             const b = buckets[Math.min(i, buckets.length - 1)]
@@ -4889,7 +4919,7 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
     const to = dateRange ? dateRange.to.getTime() : Date.now()
     const from = dateRange ? dateRange.from.getTime() : to - 86_400_000
     return makeBurnTrend(from, to)
-  }, [dateRange, data.allVolume, isElastic])
+  }, [dateRange, data.allVolume, isElastic, teamDomains])
 
   const BREACH_HISTORY = [
     { when: '16:03–16:18 UTC', lob: 'mps', desc: 'Auth success rate below 99.9% for 15m — conn pool exhausted', severity: 'critical', mttr: '18m' },
@@ -4897,13 +4927,13 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
     { when: '09:12–09:43 UTC', lob: 'mrd', desc: 'Signal plan freshness degraded — detector coverage 71%', severity: 'medium', mttr: '31m' },
     { when: '06:04–06:09 UTC', lob: 'ssa', desc: 'Alert latency SLO breach — classifier GPU backpressure', severity: 'high', mttr: '5m' },
     { when: 'Yesterday 22:10', lob: 'mps', desc: 'Auth burst — 142 failures in 90s', severity: 'medium', mttr: '12m' },
-  ]
+  ].filter(b => b.lob === domain)
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
       {/* SLA matrix */}
       <div className="card p-4">
-        <SectionHeader title="SLA Attainment" sub={`all LoBs · ${dateRange?.label ?? timeWindow ?? '24h'}`} />
+        <SectionHeader title="SLA Attainment" sub={`${DOMAIN_BY_ID[domain]?.label ?? domain} · ${dateRange?.label ?? timeWindow ?? '24h'}`} />
         <div className="mono text-[10px] text-[var(--c-faint)] grid gap-2 px-1 pb-2 uppercase tracking-widest"
           style={{ gridTemplateColumns: '140px 1fr 80px 80px 80px 60px' }}>
           <span>LoB</span><span>SLO</span><span className="text-right">Target</span>
@@ -4947,7 +4977,7 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
             <YAxis tick={{ fill: C.dim, fontSize: 10, fontFamily: 'JetBrains Mono' }} tickLine={false} axisLine={false} width={36} domain={[0, 8]} tickFormatter={(v: number) => `${v}×`} />
             <Tooltip content={<CustomTooltip />} />
             <ReferenceLine y={6} stroke={C.red} strokeDasharray="4 3" strokeWidth={1} />
-            {DOMAINS.map(d => (
+            {teamDomains.map(d => (
               <Line key={d.id} type="monotone" dataKey={d.id} stroke={domainColor(d.id)} strokeWidth={1.4} dot={false} name={d.short} />
             ))}
           </LineChart>
@@ -4956,7 +4986,7 @@ function SLASection({ domain, dateRange, timeWindow, data }: {
 
       {/* Breach history */}
       <div className="card p-4">
-        <SectionHeader title="Breach History" sub={`${dateRange?.label ?? 'last 24h'} · all LoBs`} />
+        <SectionHeader title="Breach History" sub={`${dateRange?.label ?? 'last 24h'} · ${DOMAIN_BY_ID[domain]?.label ?? domain}`} />
         <div className="flex flex-col gap-2">
           {BREACH_HISTORY.map((b, i) => {
             const bc = b.severity === 'critical' ? C.red : b.severity === 'high' ? C.orange : C.amber
@@ -5174,8 +5204,8 @@ function CustomAgentRunner({ ag, domain, onClose }: { ag: CustomAgentDef; domain
               </div>
               {step.citations && step.status === 'done' && (
                 <div className="flex flex-wrap gap-1 mt-1.5 ml-6">
-                  {step.citations.map(c => (
-                    <span key={c} className="mono text-[9px] px-1 py-0.5 rounded"
+                  {step.citations.map((c, ci) => (
+                    <span key={`${ci}-${c}`} className="mono text-[9px] px-1 py-0.5 rounded"
                       style={{ background: a(C.cyan, 0.08), border: `1px solid ${a(C.cyan, 0.18)}`, color: C.cyan }}>
                       {c}
                     </span>
@@ -5408,20 +5438,34 @@ function CustomAgentSection({ domain, onAgentCreated }: {
 
 // ─── AI Agent Monitor ─────────────────────────────────────────────────────────
 
-function AIMonitorSection({ metrics: sessionMetrics }: { metrics: AgentMetric[] }) {
+function AIMonitorSection({ metrics: sessionMetrics, domain, onClearSession }: { metrics: AgentMetric[]; domain: DomainFilter; onClearSession: (domain: DomainFilter) => void }) {
   const [historicalMetrics, setHistoricalMetrics] = useState<AgentMetric[]>([])
+  const [clearing, setClearing] = useState(false)
+  const [confirming, setConfirming] = useState(false)
 
-  // Load cross-session metrics from Postgres on mount; merge with current session.
+  // Load this team's cross-session metrics from Postgres; merge with current session.
   useEffect(() => {
-    fetch('/agent/metrics?limit=500')
+    fetch(`/agent/metrics?limit=500&domain=${domain}`)
       .then(r => r.json())
       .then((rows: AgentMetric[]) => setHistoricalMetrics(Array.isArray(rows) ? rows : []))
       .catch(() => {})
-  }, [])
+  }, [domain])
 
-  // Session metrics take precedence for metrics already in the current session.
+  const clearSessionLog = async () => {
+    setClearing(true)
+    try { await fetch(`/agent/metrics?domain=${domain}`, { method: 'DELETE' }) } catch {}
+    setHistoricalMetrics([])
+    onClearSession(domain)
+    setClearing(false)
+    setConfirming(false)
+  }
+
+  // Session metrics take precedence for metrics already in the current session, scoped to this team.
   const sessionIds = new Set(sessionMetrics.map(m => m.id))
-  const metrics = [...sessionMetrics, ...historicalMetrics.filter(m => !sessionIds.has(m.id))]
+  const metrics = [
+    ...sessionMetrics.filter(m => m.domain === domain),
+    ...historicalMetrics.filter(m => !sessionIds.has(m.id) && m.domain === domain),
+  ]
   const totalTokens = metrics.reduce((n, m) => n + m.inputTokens + m.outputTokens, 0)
   const avgLatencyMs = metrics.length ? Math.round(metrics.reduce((n, m) => n + m.latencyMs, 0) / metrics.length) : 0
   const avgTokSec = metrics.length ? Number((metrics.reduce((n, m) => n + m.tokPerSec, 0) / metrics.length).toFixed(1)) : 0
@@ -5461,6 +5505,20 @@ function AIMonitorSection({ metrics: sessionMetrics }: { metrics: AgentMetric[] 
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-auto pr-1">
+      {/* Link out to the self-hosted trace UI — internal host only, nothing external */}
+      <div className="flex items-center justify-end">
+        <a
+          href={`${LANGFUSE_URL}/project/${LANGFUSE_PROJECT_ID}/traces?tags=${domain}`}
+          target="_blank"
+          rel="noreferrer"
+          className="mono text-[10px] px-2 py-1 rounded flex items-center gap-1.5"
+          style={{ background: a(C.purple, 0.1), border: `1px solid ${a(C.purple, 0.3)}`, color: C.purple }}
+          title="Full prompt/response traces — self-hosted Langfuse, on-prem only"
+        >
+          ⧉ Open in Langfuse ↗
+        </a>
+      </div>
+
       {/* KPI strip */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard label="Total Calls" value={String(metrics.length)} sub="this session" color={C.cyan} />
@@ -5540,7 +5598,31 @@ function AIMonitorSection({ metrics: sessionMetrics }: { metrics: AgentMetric[] 
 
       {/* Session log */}
       <div className="card p-4">
-        <SectionHeader title="Session Log" sub={`${metrics.length} call${metrics.length !== 1 ? 's' : ''} · newest first`} />
+        <div className="flex items-start justify-between gap-3 mb-1">
+          <SectionHeader title="Session Log" sub={`${metrics.length} call${metrics.length !== 1 ? 's' : ''} · newest first`} />
+          {metrics.length > 0 && (
+            confirming ? (
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <span className="mono text-[10px]" style={{ color: C.red }}>Clear {metrics.length} calls for this team?</span>
+                <button onClick={clearSessionLog} disabled={clearing}
+                  className="mono text-[10px] px-2 py-1 rounded"
+                  style={{ background: a(C.red, 0.12), border: `1px solid ${a(C.red, 0.35)}`, color: C.red }}>
+                  {clearing ? 'Clearing…' : 'Confirm'}
+                </button>
+                <button onClick={() => setConfirming(false)}
+                  className="mono text-[10px] px-2 py-1 rounded" style={{ border: `1px solid ${C.border}`, color: C.dim }}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setConfirming(true)} title="Clear session log for this team"
+                className="mono text-[10px] px-2 py-1 rounded flex-shrink-0"
+                style={{ border: `1px solid ${C.border}`, color: C.faint }}>
+                ⌫ Clear
+              </button>
+            )
+          )}
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full mono text-[10px]" style={{ minWidth: 700 }}>
             <thead>
@@ -5589,8 +5671,9 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: string; badge?: string }
   { id: 'anomalies', label: 'Anomaly Detection', icon: '◎', badge: '7' },
   { id: 'sla', label: 'SLA', icon: '◇' },
   { id: 'rca', label: 'RCA Agent', icon: '⊕' },
-  { id: 'agent', label: 'Custom Agent', icon: '◈' },
-  { id: 'pipeline', label: 'Pipeline', icon: '⊳' },
+  // Temporarily disabled — see AppInner render switch below.
+  // { id: 'agent', label: 'Custom Agent', icon: '◈' },
+  // { id: 'pipeline', label: 'Pipeline', icon: '⊳' },
   { id: 'aimonitor', label: 'AI Monitor', icon: '◉' },
 ]
 
@@ -5625,9 +5708,95 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
   }
 }
 
+// ─── Landing — pick a team before entering the app ───────────────────────────
+
+const LS_TEAM_KEY = 'logsense-selected-team'
+
+function LandingPage({ onSelect }: { onSelect: (id: DomainId) => void }) {
+  return (
+    <div className="h-screen w-screen flex flex-col items-center justify-center gap-10 terminal-grid" style={{ background: C.bg }}>
+      <div className="flex flex-col items-center gap-2">
+        <div className="w-12 h-12 rounded flex items-center justify-center" style={{ background: a(C.cyan, 0.12), border: `1px solid ${a(C.cyan, 0.3)}` }}>
+          <span className="text-[var(--c-cyan)] text-xl">◈</span>
+        </div>
+        <div className="mono text-lg font-semibold text-[var(--c-text)]">LogSense</div>
+        <div className="mono text-[11px] text-[var(--c-faint)] uppercase tracking-widest">Select your team to continue</div>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4" style={{ maxWidth: 940 }}>
+        {DEMO_DOMAINS.map((d, i) => {
+          const col = C.series[i % C.series.length]
+          const profile = teamProfile(d.id)
+          return (
+            <button
+              key={d.id}
+              onClick={() => onSelect(d.id)}
+              className="card p-5 flex flex-col gap-3 text-left transition-colors"
+              style={{
+                borderTop: `1px solid ${C.border}`, borderRight: `1px solid ${C.border}`,
+                borderBottom: `1px solid ${C.border}`, borderLeft: `3px solid ${col}`,
+                width: 216,
+              }}
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-xl flex-shrink-0" style={{ color: col }}>{d.icon}</span>
+                <div className="min-w-0">
+                  <div className="mono text-[13px] font-semibold text-[var(--c-text)]">{d.label}</div>
+                  <div className="mono text-[9px] text-[var(--c-faint)] truncate">{d.team}</div>
+                </div>
+              </div>
+              <div className="mono text-[10px] text-[var(--c-dim)] leading-relaxed" style={{ minHeight: 48 }}>
+                {profile.posture}
+              </div>
+              <div className="mono text-[9px] flex items-center gap-1.5"
+                style={{ color: d.slo.burn > 6 ? C.red : d.slo.burn > 2 ? C.amber : C.green }}>
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${d.slo.burn > 6 ? 'animate-pulse-dot' : ''}`} style={{ background: 'currentColor' }} />
+                {d.slo.burn.toFixed(1)}× burn · {d.slo.attainment}% attainment
+              </div>
+            </button>
+          )
+        })}
+      </div>
+      <div className="mono text-[10px]" style={{ color: C.faint }}>You can switch teams later from the sidebar.</div>
+    </div>
+  )
+}
+
+/** Resolves theme + selected-team gating before the main app (and its tenant registry) mounts. */
+function AppGate() {
+  const [selectedTeam, setSelectedTeam] = useState<DomainId | null>(() => {
+    if (typeof localStorage === 'undefined') return null
+    const saved = localStorage.getItem(LS_TEAM_KEY)
+    return saved && DEMO_DOMAINS.some(d => d.id === saved) ? (saved as DomainId) : null
+  })
+  const systemDark = usePrefersDark()
+  const themeMode = (typeof localStorage !== 'undefined' && (localStorage.getItem('logsense-theme') as ThemeMode)) || 'system'
+  const isDark = themeMode === 'system' ? systemDark : themeMode === 'dark'
+  // Assign before children render so the landing page reads the active palette too.
+  C = isDark ? DARK : LIGHT
+
+  if (!selectedTeam) {
+    return (
+      <LandingPage onSelect={id => {
+        localStorage.setItem(LS_TEAM_KEY, id)
+        setSelectedTeam(id)
+      }} />
+    )
+  }
+
+  return (
+    <AppInner
+      initialDomain={selectedTeam}
+      onSwitchTeam={() => {
+        localStorage.removeItem(LS_TEAM_KEY)
+        setSelectedTeam(null)
+      }}
+    />
+  )
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
-function AppInner() {
+function AppInner({ initialDomain, onSwitchTeam }: { initialDomain: DomainId; onSwitchTeam: () => void }) {
   const [section, setSection] = useState<NavSection>('lob')
   const [logs, setLogs] = useState<LogEntry[]>(INITIAL_LOGS)
   const [live, setLive] = useState(true)
@@ -5649,7 +5818,7 @@ function AppInner() {
   const [customAgents, setCustomAgents] = useState<CustomAgentDef[]>([])
   const [agentMetrics, setAgentMetrics] = useState<AgentMetric[]>([])
   const [rcaContext, setRcaContext] = useState<RcaContext | null>(null)
-  const [domain, setDomain] = useState<DomainFilter>('mps')
+  const [domain, setDomain] = useState<DomainFilter>(initialDomain)
   const [source, setSource] = useState<DataSource>(
     () => (import.meta.env.VITE_DATA_SOURCE === 'elastic' ? 'elastic' : 'demo')
   )
@@ -5757,19 +5926,22 @@ function AppInner() {
         }}
       >
         {/* Logo */}
-        <div className="flex items-center gap-2 px-3 py-4 border-b border-[var(--c-border)] flex-shrink-0" style={{ height: 52 }}>
-          <div className="w-7 h-7 rounded flex items-center justify-center flex-shrink-0" style={{ background: a(C.cyan,0.12), border: `1px solid ${a(C.cyan,0.25)}` }}>
-            <span className="text-[var(--c-cyan)] text-sm">◈</span>
-          </div>
+        <div className={`flex items-center gap-2 border-b border-[var(--c-border)] flex-shrink-0 ${sidebarCollapsed ? 'justify-center px-1' : 'px-3'}`} style={{ height: 52 }}>
           {!sidebarCollapsed && (
-            <div>
-              <div className="mono text-[12px] font-semibold text-[var(--c-text)] leading-none">LogSense</div>
-              <div className="mono text-[9px] text-[var(--c-faint)]">Analytics Platform</div>
-            </div>
+            <>
+              <div className="w-7 h-7 rounded flex items-center justify-center flex-shrink-0" style={{ background: a(C.cyan,0.12), border: `1px solid ${a(C.cyan,0.25)}` }}>
+                <span className="text-[var(--c-cyan)] text-sm">◈</span>
+              </div>
+              <div>
+                <div className="mono text-[12px] font-semibold text-[var(--c-text)] leading-none">LogSense</div>
+                <div className="mono text-[9px] text-[var(--c-faint)]">Analytics Platform</div>
+              </div>
+            </>
           )}
           <button
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className="ml-auto text-[var(--c-faint)] hover:text-[var(--c-dim)] text-xs flex-shrink-0"
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className={`text-[var(--c-faint)] hover:text-[var(--c-dim)] text-xs flex-shrink-0 ${sidebarCollapsed ? '' : 'ml-auto'}`}
           >
             {sidebarCollapsed ? '›' : '‹'}
           </button>
@@ -5816,13 +5988,21 @@ function AppInner() {
         </nav>
 
         {/* Live indicator */}
-        <div className="p-3 border-t border-[var(--c-border)] flex-shrink-0">
+        <div className="p-3 border-t border-[var(--c-border)] flex-shrink-0 flex flex-col gap-2">
           <button
             onClick={() => setLive(!live)}
             className={`flex items-center gap-2 w-full ${sidebarCollapsed ? 'justify-center' : ''}`}
           >
             <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${live ? 'animate-pulse-dot' : ''}`} style={{ background: live ? C.green : C.faint }} />
             {!sidebarCollapsed && <span className="mono text-[10px]" style={{ color: live ? C.green : C.faint }}>{live ? 'LIVE' : 'PAUSED'}</span>}
+          </button>
+          <button
+            onClick={onSwitchTeam}
+            title="Switch team"
+            className={`flex items-center gap-2 w-full text-[var(--c-faint)] hover:text-[var(--c-dim)] ${sidebarCollapsed ? 'justify-center' : ''}`}
+          >
+            <span className="mono text-[11px] flex-shrink-0">⇄</span>
+            {!sidebarCollapsed && <span className="mono text-[10px]">Switch team</span>}
           </button>
         </div>
       </aside>
@@ -5883,31 +6063,26 @@ function AppInner() {
           </button>
         </header>
 
-        {/* LoB bar — scopes every section below */}
+        {/* Active team — fixed by the landing selection, not a switcher */}
         <div className="flex items-center gap-2 px-4 py-2 overflow-x-auto flex-shrink-0"
           style={{ borderBottom: `1px solid ${C.border}`, background: C.bg }}>
-          <span className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest flex-shrink-0">LoB</span>
-          {DOMAINS.map(d => {
-            const on = safeDomain === d.id
+          <span className="mono text-[10px] text-[var(--c-faint)] uppercase tracking-widest flex-shrink-0">Team</span>
+          {(() => {
+            const d = DOMAIN_BY_ID[safeDomain]
+            if (!d) return null
             const col = domainColor(d.id)
             return (
-              <button
-                key={d.id}
-                onClick={() => setDomain(d.id)}
+              <span
                 title={`${d.team} · ${d.policy.residency} · ${d.policy.regime}`}
-                className="mono text-[11px] px-2 py-1 rounded flex items-center gap-1.5 flex-shrink-0 transition-colors"
-                style={{
-                  background: on ? a(col, 0.14) : 'transparent',
-                  border: `1px solid ${on ? a(col, 0.45) : C.border}`,
-                  color: on ? col : C.dim,
-                }}
+                className="mono text-[11px] px-2 py-1 rounded flex items-center gap-1.5 flex-shrink-0"
+                style={{ background: a(col, 0.14), border: `1px solid ${a(col, 0.45)}`, color: col }}
               >
                 <span>{d.icon}</span>
-                <span>{d.short}</span>
+                <span>{d.label}</span>
                 {d.slo.burn > 6 && <span className="w-1.5 h-1.5 rounded-full animate-pulse-dot" style={{ background: C.red }} />}
-              </button>
+              </span>
             )
-          })}
+          })()}
           <div className="ml-auto flex items-center gap-2 flex-shrink-0">
           </div>
         </div>
@@ -5943,16 +6118,24 @@ function AppInner() {
           })()}
           <div className="flex-1 min-h-0 overflow-hidden">
           {section === 'lob' && (
-            <LobSection logs={activeLogs} domain={safeDomain} setDomain={setDomain} data={activeData} timeWindow={timeWindow} setTimeWindow={setTimeWindow} />
+            <LobSection logs={activeLogs} domain={safeDomain} setDomain={setDomain} data={activeData} timeWindow={timeWindow} setTimeWindow={setTimeWindow} dateRange={dateRange} />
           )}
           {section === 'logs' && <LogsSection logs={visibleLogs} live={live} domain={safeDomain} />}
           {section === 'errors' && <ErrorsSection logs={visibleLogs} domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'anomalies' && <AnomalySection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
           {section === 'sla' && <SLASection domain={safeDomain} dateRange={dateRange} timeWindow={timeWindow} data={activeData} />}
           {section === 'rca' && <AgentSection model={rcaModel} setModel={setRcaModel} domain={safeDomain} setDomain={setDomain} source={source} dateRange={dateRange} onContext={setRcaContext} />}
+          {/* Temporarily disabled — nav entries commented out above too.
           {section === 'agent' && <CustomAgentSection domain={safeDomain} onAgentCreated={ag => setCustomAgents(prev => [...prev, ag])} />}
           {section === 'pipeline' && <PipelineSection domain={safeDomain} timeWindow={timeWindow} setTimeWindow={setTimeWindow} data={activeData} />}
-          {section === 'aimonitor' && <AIMonitorSection metrics={agentMetrics} />}
+          */}
+          {section === 'aimonitor' && (
+            <AIMonitorSection
+              metrics={agentMetrics}
+              domain={safeDomain}
+              onClearSession={d => setAgentMetrics(prev => prev.filter(m => m.domain !== d))}
+            />
+          )}
           </div>
         </main>
       </div>
@@ -5978,7 +6161,7 @@ function AppInner() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <AppInner />
+      <AppGate />
     </ErrorBoundary>
   )
 }
